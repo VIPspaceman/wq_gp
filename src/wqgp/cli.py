@@ -13,6 +13,8 @@ Design decisions:
   so end-to-end CLI tests need no network. See D-092.
 - --telegram opts into Telegram notifications; credentials come from
   the environment. See D-097.
+- `signatures` subcommand audits a signature table; it never writes
+  the file. See D-102.
 """
 from __future__ import annotations
 
@@ -33,6 +35,8 @@ from wqgp.brain.client import (
 from wqgp.brain.pool_builder import (
     OperatorSignatureTable,
     PoolBuilder,
+    PoolBuilderError,
+    PoolBuilderProtocolError,
 )
 from wqgp.brain.transport import HttpTransport, RequestsTransport
 from wqgp.budget import Budget
@@ -49,6 +53,11 @@ from wqgp.notification.telegram import (
 from wqgp.pool import Pool, PoolError
 from wqgp.selection import SelectionConfig
 from wqgp.serialization import SerializationError
+from wqgp.signatures_audit import (
+    SignatureAudit,
+    audit_signatures,
+    format_skeletons,
+)
 
 
 log = logging.getLogger("wqgp")
@@ -229,6 +238,30 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_run.set_defaults(handler=_cmd_run)
+
+    # signatures
+    p_sig = sub.add_parser(
+        "signatures",
+        parents=[common],
+        help="audit a signature table against BRAIN's operator list",
+    )
+    p_sig.add_argument(
+        "--signatures",
+        required=True,
+        help="path to the signature table to audit",
+    )
+    p_sig.add_argument(
+        "--max-suggestions",
+        type=int,
+        default=20,
+        help="how many paste-ready skeletons to print (default: 20)",
+    )
+    p_sig.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit non-zero if the table is missing operators",
+    )
+    p_sig.set_defaults(handler=_cmd_signatures)
 
     # list-runs
     p_lr = sub.add_parser(
@@ -453,6 +486,73 @@ def _cmd_run(args: argparse.Namespace) -> int:
         result.generation, result.total_simulations_used,
     )
     return EXIT_OK
+
+
+def _cmd_signatures(args: argparse.Namespace) -> int:
+    sig_path = Path(args.signatures)
+    try:
+        table = OperatorSignatureTable.from_file(sig_path)
+    except SerializationError as e:
+        raise CliError(f"cannot load signature table: {e}") from e
+
+    try:
+        creds = BrainCredentials.from_env()
+    except BrainAuthError as e:
+        raise CliError(str(e)) from e
+
+    transport = _make_transport(args)
+    try:
+        audit = audit_signatures(creds, transport, table)
+    except (PoolBuilderError, PoolBuilderProtocolError) as e:
+        raise CliError(f"failed to audit signatures: {e}") from e
+
+    _print_audit(audit, max_suggestions=args.max_suggestions)
+
+    if args.strict and not audit.is_complete():
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def _print_audit(audit: SignatureAudit, *, max_suggestions: int) -> None:
+    print(f"BRAIN operators: {audit.brain_operator_count}")
+    print(f"Table operators: {audit.table_operator_count}")
+    print(f"Common:          {len(audit.common)}")
+    print()
+
+    if audit.extra_in_table:
+        print(
+            f"In table but not on BRAIN "
+            f"({len(audit.extra_in_table)}):"
+        )
+        for name in audit.extra_in_table:
+            print(f"  {name}")
+        print()
+        print("These may have been renamed or removed by BRAIN.")
+        print()
+
+    if audit.missing_from_table:
+        print(
+            f"Missing from table "
+            f"({len(audit.missing_from_table)}):"
+        )
+        for name in audit.missing_from_table:
+            print(f"  {name}")
+        print()
+        print("Suggested skeletons (paste into signatures.json):")
+        print(format_skeletons(
+            audit.missing_from_table,
+            limit=max_suggestions,
+        ))
+        print()
+        print(
+            'Note: type placeholder "MATRIX" is a guess. '
+            "Verify each signature"
+        )
+        print("against BRAIN's documentation before use.")
+    else:
+        print(
+            "Table is complete: every BRAIN operator has a signature."
+        )
 
 
 def _cmd_list_runs(args: argparse.Namespace) -> int:

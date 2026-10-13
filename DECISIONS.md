@@ -2305,3 +2305,135 @@ D-067, because the two are the same invariant viewed from different
 angles.
 
 ---
+
+---
+
+## D-101 — The signatures auditor is a function, not a class
+
+**Decision**: `audit_signatures(credentials, transport, table)` is a
+module-level function in `signatures_audit.py`. There is no
+`SignaturesBuilder` class. The result is a frozen `SignatureAudit`
+value object.
+
+**Why**: the audit has no state to maintain. It reads BRAIN's operator
+names, compares them to a table, returns a report, and exits. A class
+would need an `__init__`, a `close`, and a lifecycle; all of that
+would be overhead without a benefit. The function form makes the call
+site read as one operation: "audit this table against BRAIN".
+
+The result is a separate type because the CLI needs to format it and
+tests need to assert on its fields. A raw dict would be less checkable
+(no invariants) and less readable (string keys).
+
+If a second operation appears — e.g. "fill missing entries from a
+template file" — that becomes another function in the same module.
+Only if multiple operations need to share login state does a class
+become justified.
+
+**Revisit if**: we add stateful operations (e.g. a cursor that walks
+BRAIN's operator list page by page and pauses). Then a small
+`SignaturesSession` class wrapping the auth flag is justified. Do NOT
+create it preemptively.
+
+---
+
+## D-102 — The auditor never writes to the signature file
+
+**Decision**: `audit_signatures` reads BRAIN, reads the table (which
+the caller loaded), and returns a report. It does not open, modify, or
+overwrite the signature file. The CLI prints the report and exits.
+
+**Why**: an audit that silently modifies the file it audits is a
+footgun. Two failure modes would appear immediately.
+
+(1) A partially-filled table becomes a trap. If the auditor appends
+placeholder entries for missing operators, those placeholders flow
+into the next `build-pool` call, and `OperatorSignatureTable.from_dict`
+either rejects them (breaking the pipeline) or parses them (silently
+producing wrong signatures). Neither is acceptable.
+
+(2) The user loses track of what they wrote. A signature table is a
+hand-curated asset. Its diff should be under the user's control; a
+tool that rewrites it turns "git diff" from a reviewable record into
+a fight.
+
+The output includes paste-ready skeletons (D-103) so the user can
+add entries with minimal friction. The choice to add them stays with
+the user.
+
+**Revisit if**: we add a `--write` flag that the user opts into. Then
+the write path is explicit and the diff is still reviewable. The
+default must remain read-only.
+
+---
+
+## D-103 — Skeletons use MATRIX as an obvious placeholder, not a guess
+
+**Decision**: `format_skeletons` emits
+`{"name": "X", "input_types": ["MATRIX"], "output_type": "MATRIX"}`
+for each missing operator. It does not attempt to infer the actual
+types from BRAIN's description or from operator naming conventions.
+
+**Why**: two forces.
+
+(1) The standing rule (D-084) is that we do not guess signatures. A
+guessed MATRIX-typed `ts_mean` would type check against `add(ts_mean
+(...), 1)` and silently break the meaning of the expression. Once a
+guess is written into the file, it looks like a decision, not a
+placeholder.
+
+(2) A skeleton with a wrong placeholder is still useful because the
+placeholder is visibly wrong. If a user pastes the skeleton and
+forgets to change `"MATRIX"`, `operator_from_dict` will accept it
+(the string is a valid DataType), but the human review of the diff
+will catch it — the type is wrong for most operators and that is
+obvious at a glance.
+
+The safer alternative — emitting a deliberately invalid placeholder
+like `"TODO"` — was rejected because it makes the table unusable until
+every entry is edited. A user who wants to run a 20-operator subset
+should be able to paste 20 skeletons, edit the 3 they care about, and
+delete the rest. The current placeholder supports that workflow; the
+"TODO" placeholder does not.
+
+**Revisit if**: the placeholder is empirically mistaken for a real
+signature in practice. Then switch to a discriminated `{"kind":
+"TODO"}` marker that `operator_from_dict` rejects explicitly. Do NOT
+make the placeholder silent — a wrongly-typed operator that passes
+the loader is worse than one that fails.
+
+---
+
+## D-104 — The auditor does not close the caller's transport
+
+**Decision**: `audit_signatures` constructs a `PoolBuilder` to borrow
+its authenticated pagination, but does NOT call `builder.close()`. The
+caller owns the transport and is responsible for closing it.
+
+**Why**: `PoolBuilder.close()` closes the underlying transport. When
+the caller passes a shared transport (the CLI's `_make_transport`
+result, or a test's `ScriptedTransport`), closing it inside the audit
+would break any subsequent use in the same process. The audit is a
+read-only, short-lived operation; leaving the transport open is the
+right default.
+
+The alternative — auditing without a `PoolBuilder`, by duplicating the
+pagination logic — was rejected because the duplication is nontrivial
+(authentication caching, page-loop termination, response-shape
+tolerance) and this is the third consumer of that logic (after
+`PoolBuilder` itself and the CLI). Duplicating a 40-line function
+three times is worse than one caller paying attention to lifecycle.
+
+The consequence is that a caller who audits repeatedly with the same
+transport re-authenticates on each call. That is cheap (one POST) and
+correct. A future optimization, if it becomes necessary, would be a
+public `PoolBuilder.fetch_operator_names()` that reuses an existing
+`PoolBuilder` instance passed by the caller.
+
+**Revisit if**: the re-authentication cost becomes measurable (e.g.
+auditing dozens of signature variants in a loop). Then the API
+changes to accept an already-authenticated `PoolBuilder`, and the
+caller manages its lifetime explicitly. The current signature stays
+for the common one-shot case.
+
+---

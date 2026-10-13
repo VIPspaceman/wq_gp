@@ -10,11 +10,12 @@ Phase 3 (GP core)    — COMPLETE.
 
 Phase 4 (polish) — IN PROGRESS.
 
-- [x] `brain/pool_builder.py`    — fetch fields + operator names from BRAIN
-- [x] `cli.py`                   — command-line entry point
-- [x] `notification/`            — run lifecycle notifications (Telegram)
-- [ ] `pareto.py`                — multi-objective selection
-- [ ] `tools/`                   — analysis scripts
+- [x] `brain/pool_builder.py`  — fetch fields + operator names from BRAIN
+- [x] `cli.py`                 — command-line entry point
+- [x] `notification/`          — run lifecycle notifications (Telegram)
+- [x] `signatures_audit.py`    — audit a signature table against BRAIN
+- [ ] `pareto.py`              — multi-objective selection
+- [ ] `tools/`                 — analysis scripts
 
 See `DECISIONS.md` for every deviation from the reference project.
 
@@ -29,18 +30,32 @@ Secrets are read only from the environment:
     export WQ_BRAIN_USERNAME=...
     export WQ_BRAIN_PASSWORD=...
 
-### 1. Build the pool
+### 1. Audit / build the signature table
+
+BRAIN's `/operators` endpoint returns names and descriptions only, not
+type signatures. The signature table is a hand-curated JSON file that
+supplies the rest. To see which operators BRAIN exposes that are
+missing from your table:
+
+    wqgp signatures --signatures signatures.json
+
+Output lists missing operators and prints paste-ready JSON skeletons.
+Add the ones you need to `signatures.json`, then verify each signature
+against BRAIN's docs — the `"MATRIX"` placeholder is a guess.
+
+Use `--strict` in CI to fail when the table is incomplete.
+
+### 2. Build the pool
 
     wqgp build-pool \
         --signatures signatures.json \
         --output pool.json
 
-The signature table is a JSON file with the type signatures for the
-operators you want to use. BRAIN's `/operators` endpoint returns names
-only; this table supplies the rest. The builder drops operators not
-present in the table and reports them.
+Fetches BRAIN's data fields and operator names, joins them with the
+signature table, and writes the result. Operators named by BRAIN but
+not present in the table are dropped and reported.
 
-### 2. Run the GP
+### 3. Run the GP
 
     wqgp run \
         --pool pool.json \
@@ -53,7 +68,7 @@ present in the table and reports them.
 
 Re-running with the same `--run-id` resumes from the last checkpoint.
 
-### 3. Telegram notifications
+### 4. Telegram notifications
 
     export TELEGRAM_BOT_TOKEN=...
     export TELEGRAM_CHAT_ID=...
@@ -64,7 +79,7 @@ Lifecycle events (run start, each generation's best fitness, run end)
 are pushed to the configured chat. If Telegram is unreachable, the
 run continues; only a warning is logged.
 
-### 4. Smoke-test without network
+### 5. Smoke-test without network
 
     wqgp run \
         --pool pool.json \
@@ -75,7 +90,7 @@ run continues; only a warning is logged.
 
 `--dry-run` uses a deterministic fake evaluator. No credentials needed.
 
-### 5. Inspect runs
+### 6. Inspect runs
 
     wqgp list-runs --checkpoint-root ./checkpoints
 
@@ -116,6 +131,7 @@ Credentials are NOT accepted in the config file.
     src/wqgp/selection.py         # SelectionConfig, tournament, elitism
     src/wqgp/gp_serialization.py  # AST / Individual / Population JSON
     src/wqgp/coordinator.py       # RunConfig, Coordinator, RunResult
+    src/wqgp/signatures_audit.py  # audit_signatures, SignatureAudit
     src/wqgp/cli.py               # command-line entry point
     src/wqgp/__main__.py          # python -m wqgp
     src/wqgp/brain/
