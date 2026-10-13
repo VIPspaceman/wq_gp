@@ -2552,3 +2552,51 @@ its existing `to_api_dict()`. Do NOT duplicate the four-key dict in
 each endpoint's fetch method.
 
 ---
+
+---
+
+## D-108 — PoolBuilder retries 429 with header-driven backoff
+
+**Decision**: when `_fetch_paginated` receives an HTTP 429, it sleeps
+for the interval advertised in the response's `Retry-After` header,
+falling back to `ratelimit-reset`, falling back to a configurable
+`retry_after_default` (5.0s). It retries up to `max_retries_on_429`
+times (default 3) before raising `PoolBuilderError`. The `sleep_fn`
+is injectable for tests. The default `page_limit` is raised from 50
+to 500, cutting the number of requests for a full `/data-fields`
+fetch from ~88 to ~9.
+
+**Why**: BRAIN caps requests at 50/minute (`x-ratelimit-limit-minute:
+50` in every response). Fetching all ~4400 USA/TOP3000/delay=1 fields
+at `page_limit=50` requires 88 requests, well over the quota. The
+first `build-pool` attempt failed at offset 200 with 429.
+
+Two changes together. Raising `page_limit` avoids the limit in the
+common case; retrying handles the case where the limit is still hit
+(e.g. a first fetch followed immediately by a second, or multiple
+parallel CLIs). Neither change alone is sufficient — a large page
+size can still blow through the quota if the user runs back-to-back
+fetches, and the retry alone would make the default fetch take
+minutes due to repeated sleeps.
+
+BRAIN advertises two headers: `Retry-After` (HTTP standard) and
+`ratelimit-reset` (BRAIN-specific seconds-until-reset). We check
+Retry-After first, then ratelimit-reset, so a standards-compliant
+proxy in front of BRAIN also works. The default is 5.0 seconds, long
+enough to be useful and short enough to not feel like a hang.
+
+The retry counter is per-request, not per-fetch. A page that succeeds
+on the third attempt resets nothing; the next page starts with a
+fresh counter. This matches the semantics of "each request is
+independently rate-limited".
+
+`sleep_fn` is injectable for the same reason as D-077 (in the
+BrainClient): tests that assert on sleeps must not actually sleep.
+
+**Revisit if**: BRAIN's rate limit changes to a sliding window that a
+fixed 5-second default does not fit. Then the default becomes a
+configurable derived value (e.g. `60 / limit + 1`). Do NOT remove the
+retry — a hard 429 that kills a multi-minute fetch is worse than a
+few seconds of sleeping.
+
+---

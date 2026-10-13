@@ -13,6 +13,8 @@ Design decisions:
   See D-106.
 - /data-fields requires simulation settings as query parameters; the
   builder takes an optional BrainSettings. See D-107.
+- HTTP 429 is retried after the interval advertised in Retry-After or
+  ratelimit-reset, up to max_retries_on_429. See D-108.
 
 BRAIN does not return operator type signatures. The /operators endpoint
 gives names and descriptions only. Without signatures, an OperatorDef
@@ -23,9 +25,10 @@ signature table and drops operators it cannot build.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from wqgp.brain.client import (
     BrainAuthError,
@@ -59,7 +62,8 @@ _OPERATORS_URL = f"{_BASE_URL}/operators"
 # --- errors -----------------------------------------------------------------
 
 class PoolBuilderError(RuntimeError):
-    """Raised on unrecoverable builder failures (auth, transport)."""
+    """Raised on unrecoverable builder failures (auth, transport, 429
+    after all retries exhausted)."""
 
 
 class PoolBuilderProtocolError(PoolBuilderError):
@@ -184,7 +188,7 @@ class OperatorSignatureTable:
         return cls.from_dict(data)
 
 
-# --- pagination helper (D-085, D-106) ---------------------------------------
+# --- pagination helper (D-085, D-106, D-108) --------------------------------
 
 def _extract_items(payload: Any, endpoint: str) -> list[Any]:
     """BRAIN list endpoints return either a bare list or an object with
@@ -214,6 +218,29 @@ def _settings_query(settings: BrainSettings) -> dict[str, str]:
     }
 
 
+def _parse_retry_after(resp: Any, default: float) -> float:
+    """Extract a wait time from the response headers.
+
+    BRAIN advertises two relevant headers:
+    - `Retry-After`: the HTTP standard.
+    - `ratelimit-reset`: a BRAIN-specific seconds-until-reset header.
+    We check Retry-After first, then ratelimit-reset. If neither parses
+    as a number, we fall back to `default`.
+    """
+    for header in ("Retry-After", "ratelimit-reset"):
+        raw = resp.header(header)
+        if raw is None:
+            continue
+        try:
+            wait = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if wait < 0:
+            continue
+        return wait
+    return default
+
+
 # --- builder ----------------------------------------------------------------
 
 class PoolBuilder:
@@ -235,6 +262,9 @@ class PoolBuilder:
         "_page_limit",
         "_max_pages",
         "_http_timeout",
+        "_sleep_fn",
+        "_max_retries_on_429",
+        "_retry_after_default",
         "_authenticated",
     )
 
@@ -244,9 +274,12 @@ class PoolBuilder:
         transport: HttpTransport,
         settings: BrainSettings | None = None,
         *,
-        page_limit: int = 50,
+        page_limit: int = 500,
         max_pages: int = 200,
         http_timeout: float = 30.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        max_retries_on_429: int = 3,
+        retry_after_default: float = 5.0,
     ) -> None:
         if page_limit < 1:
             raise ValueError("page_limit must be >= 1")
@@ -254,12 +287,19 @@ class PoolBuilder:
             raise ValueError("max_pages must be >= 1")
         if http_timeout <= 0:
             raise ValueError("http_timeout must be > 0")
+        if max_retries_on_429 < 0:
+            raise ValueError("max_retries_on_429 must be >= 0")
+        if retry_after_default <= 0:
+            raise ValueError("retry_after_default must be > 0")
         self._credentials = credentials
         self._transport = transport
         self._settings = settings if settings is not None else BrainSettings()
         self._page_limit = page_limit
         self._max_pages = max_pages
         self._http_timeout = http_timeout
+        self._sleep_fn = sleep_fn
+        self._max_retries_on_429 = max_retries_on_429
+        self._retry_after_default = retry_after_default
         self._authenticated = False
 
     # --- lifecycle -----------------------------------------------------
@@ -300,10 +340,15 @@ class PoolBuilder:
         request, alongside `limit` and `offset`. The order is
         deterministic (sorted keys) so URLs are reproducible.
 
-        Loop termination: a page shorter than page_limit marks the end.
-        Additionally, if a page equals the previous page byte-for-byte,
-        the server is ignoring limit/offset and we treat the first page
-        as the whole result. See D-106.
+        Termination:
+          - A page shorter than page_limit marks the end (D-085).
+          - A page identical to its predecessor means the server is
+            ignoring limit/offset; we return the first page (D-106).
+
+        Rate limiting:
+          - HTTP 429 is retried after the interval advertised in
+            Retry-After or ratelimit-reset, up to max_retries_on_429
+            times (D-108).
         """
         self._ensure_authenticated()
         all_items: list[Any] = []
@@ -316,29 +361,9 @@ class PoolBuilder:
             sorted_extra = sorted(extra_params.items())
 
         for _ in range(self._max_pages):
-            query_parts = [f"{k}={v}" for k, v in sorted_extra]
-            query_parts.append(f"limit={self._page_limit}")
-            query_parts.append(f"offset={offset}")
-            url = f"{endpoint}?{'&'.join(query_parts)}"
-
-            try:
-                resp = self._transport.request(
-                    "GET", url, timeout=self._http_timeout
-                )
-            except TransportError as e:
-                raise PoolBuilderError(
-                    f"{endpoint}: transport error at offset {offset}: {e}"
-                ) from e
-
-            if resp.status_code == 401:
-                self._authenticated = False
-                raise PoolBuilderError(
-                    f"{endpoint}: 401 at offset {offset}"
-                )
-            if resp.status_code != 200:
-                raise PoolBuilderError(
-                    f"{endpoint}: HTTP {resp.status_code} at offset {offset}"
-                )
+            resp = self._get_page_with_retry(
+                endpoint, sorted_extra, offset
+            )
 
             try:
                 payload = resp.json()
@@ -373,6 +398,55 @@ class PoolBuilder:
             f"{offset}. The server is returning distinct full pages "
             f"that ignore limit/offset; check the endpoint's API."
         )
+
+    def _get_page_with_retry(
+        self,
+        endpoint: str,
+        sorted_extra: list[tuple[str, str]],
+        offset: int,
+    ):
+        """Issue one page GET, retrying on 429 up to the configured cap."""
+        query_parts = [f"{k}={v}" for k, v in sorted_extra]
+        query_parts.append(f"limit={self._page_limit}")
+        query_parts.append(f"offset={offset}")
+        url = f"{endpoint}?{'&'.join(query_parts)}"
+
+        attempts = 0
+        while True:
+            try:
+                resp = self._transport.request(
+                    "GET", url, timeout=self._http_timeout
+                )
+            except TransportError as e:
+                raise PoolBuilderError(
+                    f"{endpoint}: transport error at offset {offset}: {e}"
+                ) from e
+
+            if resp.status_code == 401:
+                self._authenticated = False
+                raise PoolBuilderError(
+                    f"{endpoint}: 401 at offset {offset}"
+                )
+
+            if resp.status_code == 429:
+                attempts += 1
+                if attempts > self._max_retries_on_429:
+                    raise PoolBuilderError(
+                        f"{endpoint}: HTTP 429 at offset {offset} "
+                        f"after {self._max_retries_on_429} retries"
+                    )
+                wait = _parse_retry_after(
+                    resp, self._retry_after_default
+                )
+                self._sleep_fn(wait)
+                continue
+
+            if resp.status_code != 200:
+                raise PoolBuilderError(
+                    f"{endpoint}: HTTP {resp.status_code} at offset {offset}"
+                )
+
+            return resp
 
     # --- field parsing -------------------------------------------------
 

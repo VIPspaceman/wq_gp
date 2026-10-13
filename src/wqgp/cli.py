@@ -235,8 +235,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bp.add_argument(
         "--page-limit",
         type=int,
-        default=50,
-        help="page size for paginated endpoints (default: 50)",
+        default=500,
+        help=(
+            "page size for paginated endpoints (default: 500). "
+            "BRAIN limits requests per minute; a large page size "
+            "avoids hitting the limit. See D-108."
+        ),
+    )
+    p_bp.add_argument(
+        "--max-retries-on-429",
+        type=int,
+        default=3,
+        help=(
+            "how many times to retry a rate-limited request "
+            "(default: 3)"
+        ),
     )
     p_bp.add_argument(
         "--max-pages",
@@ -388,6 +401,7 @@ def _cmd_build_pool(args: argparse.Namespace) -> int:
         settings=settings,
         page_limit=args.page_limit,
         max_pages=args.max_pages,
+        max_retries_on_429=args.max_retries_on_429,
     )
     try:
         result = builder.build(signatures)

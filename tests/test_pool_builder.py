@@ -566,6 +566,114 @@ def test_builder_settings_default_is_usa_top3000() -> None:
     assert "delay=1" in urls[0]
 
 
+def test_fetch_retries_on_429() -> None:
+    """A 429 is retried after Retry-After; the second attempt succeeds.
+    See D-108."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect(
+        "GET", "/data-fields",
+        make_response(429, headers={"Retry-After": "0.01"}),
+        _page([_field("close")]),
+    )
+
+    sleeps: list[float] = []
+    b = PoolBuilder(
+        credentials=_creds(),
+        transport=t,
+        sleep_fn=sleeps.append,
+        page_limit=50,
+        max_pages=10,
+        max_retries_on_429=2,
+    )
+    fields, _, _ = b.fetch_fields()
+
+    assert [f.field_id for f in fields] == ["close"]
+    assert sleeps == [0.01]
+
+
+def test_fetch_429_reads_brain_ratelimit_reset_header() -> None:
+    """BRAIN uses `ratelimit-reset` when `Retry-After` is absent.
+    See D-108."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect(
+        "GET", "/data-fields",
+        make_response(429, headers={"ratelimit-reset": "7"}),
+        _page([_field("close")]),
+    )
+
+    sleeps: list[float] = []
+    b = PoolBuilder(
+        credentials=_creds(),
+        transport=t,
+        sleep_fn=sleeps.append,
+        max_retries_on_429=2,
+    )
+    b.fetch_fields()
+    assert sleeps == [7.0]
+
+
+def test_fetch_429_without_headers_uses_default() -> None:
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect(
+        "GET", "/data-fields",
+        make_response(429),  # no headers
+        _page([_field("close")]),
+    )
+
+    sleeps: list[float] = []
+    b = PoolBuilder(
+        credentials=_creds(),
+        transport=t,
+        sleep_fn=sleeps.append,
+        max_retries_on_429=2,
+        retry_after_default=3.5,
+    )
+    b.fetch_fields()
+    assert sleeps == [3.5]
+
+
+def test_fetch_gives_up_after_max_retries() -> None:
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect(
+        "GET", "/data-fields",
+        *[make_response(429, headers={"Retry-After": "0.01"})] * 3,
+    )
+
+    sleeps: list[float] = []
+    b = PoolBuilder(
+        credentials=_creds(),
+        transport=t,
+        sleep_fn=sleeps.append,
+        max_retries_on_429=2,
+    )
+    with pytest.raises(PoolBuilderError):
+        b.fetch_fields()
+    # 2 retries, then give up.
+    assert len(sleeps) == 2
+
+
+def test_builder_rejects_negative_max_retries() -> None:
+    with pytest.raises(ValueError):
+        PoolBuilder(
+            credentials=_creds(),
+            transport=ScriptedTransport(),
+            max_retries_on_429=-1,
+        )
+
+
+def test_builder_rejects_bad_retry_after_default() -> None:
+    with pytest.raises(ValueError):
+        PoolBuilder(
+            credentials=_creds(),
+            transport=ScriptedTransport(),
+            retry_after_default=0,
+        )
+
+
 def test_fetch_transport_error_raises() -> None:
     t = ScriptedTransport()
     t.expect("POST", "/authentication", _login_ok())
