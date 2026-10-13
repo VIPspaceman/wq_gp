@@ -4,20 +4,23 @@ Design decisions:
 - Budget is consumed at SUBMIT time, not at completion. See D-032.
 - Evaluator is a Protocol, not an ABC. See D-033.
 - Worker swallows all exceptions into a FAILED record. See D-034.
-- Task / TaskResult are frozen value objects; TaskStatus is local. See D-035.
+- Task / TaskResult are frozen value objects; TaskStatus is local. See
+  D-035.
 - stdlib queue.Queue + sentinel shutdown. See D-036.
 - Stats exposed as a frozen snapshot. See D-037.
+- Numeric fields (fitness, metrics) must be FINITE. See D-125.
 
 This module does NOT talk to BRAIN. It runs any callable that maps
 `Task -> TaskResult`. Wiring the real BRAIN client is Phase 3's job.
 """
 from __future__ import annotations
 
+import math
 import queue
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 from wqgp.budget import BudgetExhausted, BudgetTracker
 from wqgp.persistence import EvaluationRecord, EvaluationStatus, EvaluationStore
@@ -27,6 +30,23 @@ class TaskStatus(str, Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+
+
+def _is_finite_number(v: Any) -> bool:
+    """True iff v is an int or float, not a bool, and not NaN or inf.
+
+    Order matters: `isinstance(True, int)` is True in Python, so bool
+    must be rejected before the int/float check. And
+    `math.isfinite(True)` is also True, so the bool check cannot be
+    folded into the finite check.
+    """
+    if isinstance(v, bool):
+        return False
+    if not isinstance(v, (int, float)):
+        return False
+    if isinstance(v, float) and not math.isfinite(v):
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,9 +76,9 @@ class TaskResult:
     """Result returned by an Evaluator.
 
     Invariants:
-      - SUCCESS requires fitness
+      - SUCCESS requires a finite fitness
       - FAILED requires non-empty error
-      - metrics values must be numeric (bool excluded)
+      - metric values must be finite numbers (bool excluded)
     """
     fingerprint: str
     status: TaskStatus
@@ -73,13 +93,20 @@ class TaskResult:
             raise ValueError(
                 f"status must be TaskStatus, got {type(self.status).__name__}"
             )
+
+        if self.fitness is not None and not _is_finite_number(self.fitness):
+            raise ValueError(
+                f"fitness must be a finite number, got {self.fitness!r}"
+            )
+
         for k, v in self.metrics:
             if not isinstance(k, str) or not k:
                 raise ValueError("metric name must be a non-empty string")
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
+            if not _is_finite_number(v):
                 raise ValueError(
-                    f"metric {k!r} must be int/float, got {type(v).__name__}"
+                    f"metric {k!r} must be a finite number, got {v!r}"
                 )
+
         if self.status is TaskStatus.SUCCESS and self.fitness is None:
             raise ValueError("SUCCESS TaskResult requires fitness")
         if self.status is TaskStatus.FAILED and (

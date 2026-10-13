@@ -8,12 +8,15 @@ Design decisions:
 - AST generation is bottom-up with three hard limits. See D-042.
 - Generation failure raises; it does not return None. See D-043.
 - Only SCALAR leaves can be literals. See D-044.
+- Individual.with_status propagates terminal states (e.g. FAILED) so
+  that failed evaluations are not resubmitted. See D-125.
 
 This module does NOT evaluate individuals and does NOT talk to BRAIN.
 Fitness on an Individual is whatever the caller set; it may be None.
 """
 from __future__ import annotations
 
+import math
 import random
 from types import MappingProxyType
 from typing import Mapping
@@ -39,6 +42,18 @@ class GenerationError(PopulationError):
     """Raised when RandomAstBuilder cannot construct a valid AST."""
 
 
+# --- numeric helpers --------------------------------------------------------
+
+def _is_finite_number(v: object) -> bool:
+    if isinstance(v, bool):
+        return False
+    if not isinstance(v, (int, float)):
+        return False
+    if isinstance(v, float) and not math.isfinite(v):
+        return False
+    return True
+
+
 # --- Individual -------------------------------------------------------------
 
 class Individual:
@@ -50,7 +65,8 @@ class Individual:
     right thing during dedup.
 
     Instances are effectively immutable: attribute reassignment raises.
-    Use `with_evaluation()` to obtain a new Individual carrying results.
+    Use `with_evaluation()` to obtain a new Individual carrying results,
+    and `with_status()` to propagate a terminal state.
     """
 
     __slots__ = (
@@ -78,13 +94,20 @@ class Individual:
             raise ValueError("fingerprint must be non-empty")
         if generation < 0:
             raise ValueError("generation must be >= 0")
+
+        if fitness is not None and not _is_finite_number(fitness):
+            raise ValueError(
+                f"fitness must be a finite number, got {fitness!r}"
+            )
+
         for k, v in metrics:
             if not isinstance(k, str) or not k:
                 raise ValueError("metric name must be a non-empty string")
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
+            if not _is_finite_number(v):
                 raise ValueError(
-                    f"metric {k!r} must be int/float, got {type(v).__name__}"
+                    f"metric {k!r} must be a finite number, got {v!r}"
                 )
+
         if status is EvaluationStatus.SUCCESS and fitness is None:
             raise ValueError("SUCCESS individual requires fitness")
 
@@ -136,6 +159,26 @@ class Individual:
             generation=self.generation,
             parents=self.parents,
             status=EvaluationStatus.SUCCESS,
+        )
+
+    def with_status(self, status: EvaluationStatus) -> "Individual":
+        """Return a new Individual with a different status.
+
+        Used to propagate terminal states (e.g. FAILED) so that the
+        Coordinator's _evaluate does not resubmit them. See D-125.
+
+        A SUCCESS status requires a non-None fitness; constructing an
+        Individual with SUCCESS and no fitness raises ValueError, which
+        is exactly the desired behavior here.
+        """
+        return Individual(
+            ast=self.ast,
+            fingerprint=self.fingerprint,
+            fitness=self.fitness,
+            metrics=self.metrics,
+            generation=self.generation,
+            parents=self.parents,
+            status=status,
         )
 
     # --- immutability ---
@@ -280,7 +323,6 @@ def _sample_param(
     raise GenerationError(f"unknown param kind: {domain.kind!r}")
 
 
-# Literal values used when a SCALAR leaf is a constant rather than a field.
 _LITERAL_POOL: tuple[int | float, ...] = (1, 5, 10, 0.5, 1.0, -1)
 
 
@@ -319,11 +361,7 @@ class RandomAstBuilder:
         self._max_nodes = max_nodes
         self._max_operator_attempts = max_operator_attempts
         self._nodes_left = 0
-        # Placeholder; overwritten by build(). Using a real Random rather
-        # than None keeps internal methods free of None checks.
         self._rng: random.Random = random.Random()
-
-    # --- public ---
 
     def build(self, target_type: DataType, rng: random.Random) -> ASTNode:
         """Return a random AST of `target_type`, or raise GenerationError."""
@@ -338,8 +376,6 @@ class RandomAstBuilder:
             f"within {self._max_operator_attempts} attempts"
         )
 
-    # --- recursion ---
-
     def _build(self, target_type: DataType, depth: int) -> ASTNode | None:
         if self._nodes_left < 1:
             return None
@@ -351,7 +387,6 @@ class RandomAstBuilder:
         return self._build_leaf(target_type)
 
     def _build_leaf(self, target_type: DataType) -> ASTNode | None:
-        # Only SCALAR may be a literal. See D-044.
         if target_type is DataType.SCALAR:
             scalar_fields = self._pool.fields.by_type(DataType.SCALAR)
             if scalar_fields and self._rng.random() < 0.5:
@@ -369,9 +404,7 @@ class RandomAstBuilder:
         self._nodes_left -= 1
         return ASTNode.literal(self._rng.choice(_LITERAL_POOL))
 
-    def _build_call(
-        self, target_type: DataType, depth: int
-    ) -> ASTNode | None:
+    def _build_call(self, target_type: DataType, depth: int) -> ASTNode | None:
         candidates = self._pool.operators.by_output_type(target_type)
         if not candidates:
             return None
@@ -385,18 +418,16 @@ class RandomAstBuilder:
                 return node
         return None
 
-    def _try_operator(
-        self, op: OperatorDef, depth: int
-    ) -> ASTNode | None:
+    def _try_operator(self, op: OperatorDef, depth: int) -> ASTNode | None:
         if self._nodes_left < 1:
             return None
-        self._nodes_left -= 1  # reserve a slot for the call itself
+        self._nodes_left -= 1
 
         children: list[ASTNode] = []
         for position_types in op.input_types:
             child_type = self._pick_position_type(position_types)
             if child_type is None:
-                self._nodes_left += 1  # refund
+                self._nodes_left += 1
                 return None
             child = self._build(child_type, depth - 1)
             if child is None:
@@ -410,17 +441,12 @@ class RandomAstBuilder:
         try:
             return ASTNode.call(op, tuple(children), params)
         except ValueError:
-            # Type or param validation failed: refund and give up on this
-            # operator. The caller will try another candidate.
             self._nodes_left += 1
             return None
 
     def _pick_position_type(
         self, expected: frozenset[DataType]
     ) -> DataType | None:
-        """Pick a concrete DataType from a union position, preferring types
-        the pool can actually populate. SCALAR is always available because
-        a literal can always be constructed."""
         if not expected:
             return None
         available: list[DataType] = []

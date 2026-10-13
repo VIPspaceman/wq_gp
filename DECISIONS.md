@@ -3024,3 +3024,116 @@ the top level without also splitting the CLI flag into `--settings`
 and `--run-config`.
 
 ---
+
+---
+
+## D-122 — Handoff edits are always whole files, never patches
+
+**Decision**: any change to an existing source file is delivered as
+the complete file, verbatim, with no abridgement and no line-anchored
+instructions. New files are always complete. The only exception is a
+one-line change to a file under 100 lines where the location is
+unambiguous (e.g. "add this import as the first line").
+
+**Why**: line-anchored edits have failed to land in this project
+repeatedly. Three concrete cases:
+
+- The ScriptedTransport URL-matching fix (D-079): the patch was
+  specified by line context; the next test run showed the old code.
+- The progress-logging patch (D-115): four line-anchored edits to
+  two files; only `coordinator.py` was applied.
+- The Settings test update (D-121): three test replacements described
+  as "find X, change to Y"; the next pytest showed the old tests still
+  present and failing.
+
+Each failure cost a round trip and, in the logging case, required
+re-delivering `coordinator.py` as a whole file anyway. The line-anchor
+approach saves tokens in the message but doubles the number of
+messages, which is a net loss.
+
+Whole-file delivery has a second benefit: the reader can diff against
+what is on disk with `git diff` before saving. A line patch has no
+such check.
+
+**Revisit if**: a file grows beyond a practical message size (roughly
+2000 lines). Then that file specifically can be delivered as a
+unified diff via `git diff` output, which the user can apply with
+`git apply`. Never fall back to prose descriptions.
+
+---
+
+## D-123 — Do not pursue a full dimensional analysis engine
+
+**Decision**: we do not implement a complete unit-calculus engine in
+the AST layer. We test `unitHandling=OFF`, and if that does not work,
+we implement a narrow "field unit learner" that records units from
+BRAIN's error messages for LEAF fields only. Nested-subtree unit
+solving is out of scope.
+
+**Why**: a complete dimensional engine (unit algebra, solving for
+unknown units in nested subtrees, auto-inserting normalization
+wrappers) is a multi-day project with an unclear payoff. The three
+proposed pieces each have an easier alternative:
+
+- Unit algebra → the narrow learner covers leaf fields, which is
+  where most error-triggering expressions bottom out.
+- Nested solving → out of scope; those errors stay as FAILED.
+- Auto-inserting `log(rank(x))` for `log(x)` → rejected outright,
+  because it silently changes what the GP is exploring (D-124).
+
+**Revisit if**: after several hundred real submissions, the failure
+rate from unit errors remains above 20%. Then the narrow learner is
+insufficient and the full engine becomes worth its cost.
+
+---
+
+---
+
+## D-125 — Numeric fields are finite; FAILED propagates to the Individual
+
+**Decision**: two related fixes from the first external audit.
+
+1. Every numeric field in `TaskResult`, `Individual`, and
+   `EvaluationRecord` must be a finite number. `math.nan`, `+inf`,
+   `-inf`, and `bool` are rejected at construction time.
+
+2. `Coordinator._merge_evaluations` propagates a FAILED record's
+   status to the Individual via `Individual.with_status(FAILED)`, so
+   the next generation's `_evaluate` skips it.
+
+**Why (1)**: `isinstance(v, (int, float))` accepts `float("nan")` and
+`float("inf")`. `NaN` in particular has the property that
+`max(a, b)` and comparisons produce order-dependent results, and its
+serialization to SQLite is version-dependent. A single NaN fitness
+can silently corrupt elite selection and `top_by_fitness` ordering.
+The check is ordered bool-first because `isinstance(True, int)` is
+True in Python and `math.isfinite(True)` is also True; only an
+explicit bool rejection is correct.
+
+**Why (2)**: the earlier implementation left failed individuals at
+status PENDING. `_evaluate` skips `is_evaluated()` and
+`status is FAILED`, but not `status is PENDING`, so the next
+generation resubmitted them. Since `EvaluationStore.record` upserts
+by `(run_id, fingerprint)`, the second submit overwrote the first
+FAILED row and burned another simulation budget on an expression
+already known to fail. This was confirmed by inspection: a failed
+individual's status never changed from PENDING.
+
+The fix intentionally distinguishes terminal failures from
+transient ones. A FAILED record is treated as terminal; SKIPPED
+records and records with unknown status are left as PENDING, so a
+future run that knows how to retry them can do so. Classification of
+failures into "terminal" vs "retryable" is a separate concern and
+belongs in the coordinator's evaluator wrapper, not here.
+
+`Individual.with_status` is a generic method rather than a
+`mark_failed` shortcut so that future terminal states (e.g. CANCELLED)
+can use the same path. Constructing an Individual with status=SUCCESS
+and fitness=None still raises, which prevents accidental misuse.
+
+**Revisit if**: the distinction between terminal and retryable
+failures needs to be encoded at write time. Then `EvaluationRecord`
+gains a `retryable: bool` field, and `_merge_evaluations` only
+propagates terminal ones. Do NOT relax the finite-number check.
+
+---

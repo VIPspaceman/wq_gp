@@ -11,17 +11,18 @@ Design decisions:
 - The loop ends on budget exhaustion, zero evaluated individuals, or
   reaching max_generations. See D-070.
 - Notifications are optional; the default is NullNotifier. See D-098.
+- Per-generation progress is logged at INFO. See D-115.
+- FAILED evaluations propagate to the Individual's status so the
+  individual is not resubmitted. See D-125.
 """
 from __future__ import annotations
 
 import logging
 import random
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 from wqgp._ids import validate_run_id
-log = logging.getLogger(__name__)
 from wqgp.ast import render as render_ast
 from wqgp.budget import Budget, BudgetTracker
 from wqgp.checkpoint import Checkpoint, CheckpointStore
@@ -312,12 +313,14 @@ class Coordinator:
         individuals: list[Individual] = []
         seen_fps: set[str] = set()
         attempts = 0
+        generation_failures = 0
         max_attempts = size * 20
         while len(individuals) < size and attempts < max_attempts:
             attempts += 1
             try:
                 ast = builder.build(DataType.MATRIX, rng)
             except GenerationError:
+                generation_failures += 1
                 continue
             fp = ast.fingerprint()
             if fp in seen_fps:
@@ -329,6 +332,20 @@ class Coordinator:
             raise CoordinatorError(
                 f"could not generate any initial individuals "
                 f"after {max_attempts} attempts"
+            )
+
+        if len(individuals) < size:
+            log.warning(
+                "[%s] initial population short: target=%d actual=%d "
+                "attempts=%d generation_failures=%d duplicates=%d",
+                self._config.run_id, size, len(individuals),
+                attempts, generation_failures,
+                attempts - generation_failures - len(individuals),
+            )
+        else:
+            log.info(
+                "[%s] initial population: %d individuals in %d attempts",
+                self._config.run_id, len(individuals), attempts,
             )
 
         pop = Population(individuals)
@@ -401,6 +418,13 @@ class Coordinator:
         return submitted
 
     def _merge_evaluations(self, pop: Population) -> Population:
+        """Absorb evaluation results from the store into `pop`.
+
+        SUCCESS records attach fitness; FAILED records mark the
+        individual permanently failed so it is not resubmitted on the
+        next generation (see D-125). SKIPPED and unknown statuses leave
+        the individual unchanged, allowing a future retry.
+        """
         updated: list[Individual] = []
         for ind in pop:
             if ind.is_evaluated():
@@ -410,15 +434,22 @@ class Coordinator:
                 updated.append(ind)
                 continue
             rec = self._store.get(self._config.run_id, ind.fingerprint)
-            if rec is None or rec.status is not EvaluationStatus.SUCCESS:
+            if rec is None:
                 updated.append(ind)
                 continue
-            updated.append(
-                ind.with_evaluation(
-                    fitness=rec.fitness,  # type: ignore[arg-type]
-                    metrics=rec.metrics,
+            if rec.status is EvaluationStatus.SUCCESS:
+                updated.append(
+                    ind.with_evaluation(
+                        fitness=rec.fitness,  # type: ignore[arg-type]
+                        metrics=rec.metrics,
+                    )
                 )
-            )
+                continue
+            if rec.status is EvaluationStatus.FAILED:
+                updated.append(ind.with_status(EvaluationStatus.FAILED))
+                continue
+            # SKIPPED or other: leave unchanged for a possible retry.
+            updated.append(ind)
         return Population(updated)
 
     # --- helpers --------------------------------------------------------
