@@ -4,25 +4,17 @@ Design decisions:
 - AST/Individual/Population serialization lives in gp_serialization.py.
   See D-065.
 - Expression rendering lives in ast.py. See D-066.
-- Checkpoints save the UNEVALUATED next-generation population. Resume
-  therefore starts from the evaluation step, matching a from-scratch
-  run exactly. See D-067.
+- Checkpoints save the UNEVALUATED next-generation population. See D-067.
 - Before submitting, existing evaluations are absorbed from the store
   so elites and resumed individuals are not re-submitted. See D-068.
 - One Executor for the whole run. See D-069.
 - The loop ends on budget exhaustion, zero evaluated individuals, or
   reaching max_generations. See D-070.
-
-Lifecycle:
-    coord = Coordinator(config, evaluator)
-    result = coord.run()   # single use; construct a new Coordinator to
-                           # run again (the EvaluationStore is closed).
-
-This module does NOT talk to BRAIN. Wire a real BRAIN client as the
-`evaluator` to do that.
+- Notifications are optional; the default is NullNotifier. See D-098.
 """
 from __future__ import annotations
 
+import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +30,13 @@ from wqgp.gp_serialization import (
     population_to_dict,
 )
 from wqgp.mutation import Mutator
+from wqgp.notification.events import (
+    GenerationEndEvent,
+    RunEndEvent,
+    RunStartEvent,
+)
+from wqgp.notification.null import NullNotifier
+from wqgp.notification.protocol import Notifier
 from wqgp.persistence import EvaluationStatus, EvaluationStore
 from wqgp.pool import Pool
 from wqgp.population import (
@@ -48,6 +47,9 @@ from wqgp.population import (
 )
 from wqgp.selection import SelectionConfig, next_generation
 from wqgp.types import DataType
+
+
+log = logging.getLogger(__name__)
 
 
 class CoordinatorError(RuntimeError):
@@ -124,17 +126,25 @@ class Coordinator:
     __slots__ = (
         "_config",
         "_evaluator",
+        "_notifier",
         "_store",
         "_ckpt_store",
         "_mutator",
         "_crossover",
     )
 
-    def __init__(self, config: RunConfig, evaluator: Evaluator) -> None:
+    def __init__(
+        self,
+        config: RunConfig,
+        evaluator: Evaluator,
+        notifier: Notifier | None = None,
+    ) -> None:
         self._config = config
         self._evaluator = evaluator
+        self._notifier: Notifier = (
+            notifier if notifier is not None else NullNotifier()
+        )
 
-        # Resolve the evaluation DB path.
         if config.evaluation_db is not None:
             db_path = Path(config.evaluation_db)
         else:
@@ -168,33 +178,57 @@ class Coordinator:
         budget_exhausted = False
         last_generation = start_gen
 
+        self._safe_notify(
+            self._notifier.on_run_start,
+            RunStartEvent(
+                run_id=self._config.run_id,
+                generation=start_gen,
+                population_size=len(pop),
+                resuming=start_gen > 0,
+            ),
+        )
+
         try:
             generation = start_gen
             while generation < self._config.max_generations:
                 tracker.start_generation()
                 last_generation = generation
 
-                # 1. Absorb any existing evaluations (elites, resume).
                 pop = self._merge_evaluations(pop)
-
-                # 2. Submit the unevaluated individuals.
                 self._evaluate(executor, pop, tracker)
-
-                # 3. Absorb the fresh evaluations.
                 pop = self._merge_evaluations(pop)
 
-                # 4. Termination checks.
                 if tracker.is_exhausted():
                     stopped_reason = "budget_exhausted"
                     budget_exhausted = True
-                    break
-                if len(pop.evaluated()) == 0:
+                elif len(pop.evaluated()) == 0:
                     stopped_reason = "no_progress"
+                elif generation + 1 >= self._config.max_generations:
+                    stopped_reason = "max_generations"
+
+                self._safe_notify(
+                    self._notifier.on_generation_end,
+                    GenerationEndEvent(
+                        run_id=self._config.run_id,
+                        generation=generation,
+                        evaluated_count=len(pop.evaluated()),
+                        best_fitness=self._best_fitness(pop),
+                        total_simulations_used=(
+                            tracker.total_simulations_used
+                        ),
+                        stopped_reason=(
+                            None if stopped_reason == "max_generations"
+                            and generation + 1 < self._config.max_generations
+                            else stopped_reason
+                        ),
+                    ),
+                )
+
+                if stopped_reason != "max_generations":
                     break
                 if generation + 1 >= self._config.max_generations:
                     break
 
-                # 5. Generate the next generation and checkpoint it.
                 pop = next_generation(
                     pop,
                     self._mutator,
@@ -208,13 +242,26 @@ class Coordinator:
             executor.shutdown()
             self._store.close()
 
-        return RunResult(
+        result = RunResult(
             generation=last_generation,
             population=pop,
             total_simulations_used=tracker.total_simulations_used,
             budget_exhausted=budget_exhausted,
             stopped_reason=stopped_reason,
         )
+
+        self._safe_notify(
+            self._notifier.on_run_end,
+            RunEndEvent(
+                run_id=self._config.run_id,
+                generation=result.generation,
+                stopped_reason=result.stopped_reason,
+                total_simulations_used=result.total_simulations_used,
+                budget_exhausted=result.budget_exhausted,
+                population_size=len(result.population),
+            ),
+        )
+        return result
 
     # --- setup ----------------------------------------------------------
 
@@ -320,8 +367,6 @@ class Coordinator:
             if ind.is_evaluated():
                 continue
             if ind.status is EvaluationStatus.FAILED:
-                # Already failed in a previous generation or run; do not
-                # retry within this run.
                 continue
             task = Task(
                 fingerprint=ind.fingerprint,
@@ -329,7 +374,7 @@ class Coordinator:
                 generation=ind.generation,
             )
             if not executor.submit(task):
-                break  # budget exhausted mid-generation
+                break
             submitted += 1
 
         if submitted > 0:
@@ -337,8 +382,6 @@ class Coordinator:
         return submitted
 
     def _merge_evaluations(self, pop: Population) -> Population:
-        """Return a new Population where any individual present in the
-        evaluation store has been given its fitness and metrics."""
         updated: list[Individual] = []
         for ind in pop:
             if ind.is_evaluated():
@@ -358,6 +401,27 @@ class Coordinator:
                 )
             )
         return Population(updated)
+
+    # --- helpers --------------------------------------------------------
+
+    def _best_fitness(self, pop: Population) -> float | None:
+        best: float | None = None
+        for ind in pop:
+            if ind.fitness is None:
+                continue
+            if best is None or ind.fitness > best:
+                best = ind.fitness
+        return best
+
+    def _safe_notify(self, fn, event) -> None:
+        """Call a notifier method. Swallows everything (D-095)."""
+        try:
+            fn(event)
+        except Exception:  # noqa: BLE001 -- D-095
+            log.warning(
+                "notifier raised; continuing without notification",
+                exc_info=True,
+            )
 
     # --- checkpoint -----------------------------------------------------
 

@@ -11,6 +11,8 @@ Design decisions:
 - Structured logging to stderr; --log-level controls verbosity. See D-091.
 - --dry-run uses a deterministic evaluator (SHA-256 of the fingerprint),
   so end-to-end CLI tests need no network. See D-092.
+- --telegram opts into Telegram notifications; credentials come from
+  the environment. See D-097.
 """
 from __future__ import annotations
 
@@ -37,6 +39,13 @@ from wqgp.budget import Budget
 from wqgp.checkpoint import CheckpointStore, CorruptCheckpointError
 from wqgp.coordinator import Coordinator, CoordinatorError, RunConfig
 from wqgp.execution import Evaluator, Task, TaskResult, TaskStatus
+from wqgp.notification.null import NullNotifier
+from wqgp.notification.protocol import Notifier
+from wqgp.notification.telegram import (
+    TelegramConfigError,
+    TelegramCredentials,
+    TelegramNotifier,
+)
 from wqgp.pool import Pool, PoolError
 from wqgp.selection import SelectionConfig
 from wqgp.serialization import SerializationError
@@ -68,7 +77,6 @@ _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 def _setup_logging(level_name: str) -> None:
     level = getattr(logging, level_name.upper(), None)
     if not isinstance(level, int):
-        # argparse choices should prevent this, but keep the guard.
         raise CliError(f"unknown log level: {level_name!r}")
     logging.basicConfig(
         level=level,
@@ -212,6 +220,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use a deterministic fake evaluator; do not contact BRAIN",
     )
+    p_run.add_argument(
+        "--telegram",
+        action="store_true",
+        help=(
+            "send lifecycle events to Telegram "
+            "(requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)"
+        ),
+    )
     p_run.set_defaults(handler=_cmd_run)
 
     # list-runs
@@ -258,6 +274,17 @@ def _make_evaluator(args: argparse.Namespace) -> Evaluator:
         return build_default_client()
     except BrainAuthError as e:
         raise CliError(str(e)) from e
+
+
+def _make_notifier(args: argparse.Namespace) -> Notifier:
+    if not args.telegram:
+        return NullNotifier()
+    try:
+        creds = TelegramCredentials.from_env()
+    except TelegramConfigError as e:
+        raise CliError(str(e)) from e
+    transport = _make_transport(args)
+    return TelegramNotifier(credentials=creds, transport=transport)
 
 
 # --- commands ---------------------------------------------------------------
@@ -397,7 +424,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         ),
     )
 
-    # Report resume vs new run before the Coordinator swallows the detail.
     ckpt_store = CheckpointStore(run_cfg.checkpoint_root)
     try:
         latest = ckpt_store.load_latest(run_cfg.run_id)
@@ -414,9 +440,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         log.info("starting new run %s", run_cfg.run_id)
 
     evaluator = _make_evaluator(args)
+    notifier = _make_notifier(args)
 
     try:
-        result = Coordinator(run_cfg, evaluator).run()
+        result = Coordinator(run_cfg, evaluator, notifier).run()
     except CoordinatorError as e:
         raise CliError(f"coordinator error: {e}") from e
 
@@ -471,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.warning("interrupted by user")
         return EXIT_INTERRUPTED
-    except Exception as e:  # noqa: BLE001 -- last-resort reporting
+    except Exception as e:  # noqa: BLE001
         log.error("unexpected error: %s", e)
         log.debug("traceback:", exc_info=True)
         return EXIT_ERROR

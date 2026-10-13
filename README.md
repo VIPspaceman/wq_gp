@@ -12,7 +12,7 @@ Phase 4 (polish) — IN PROGRESS.
 
 - [x] `brain/pool_builder.py`    — fetch fields + operator names from BRAIN
 - [x] `cli.py`                   — command-line entry point
-- [ ] `notification/telegram.py` — Telegram notifications
+- [x] `notification/`            — run lifecycle notifications (Telegram)
 - [ ] `pareto.py`                — multi-objective selection
 - [ ] `tools/`                   — analysis scripts
 
@@ -53,7 +53,18 @@ present in the table and reports them.
 
 Re-running with the same `--run-id` resumes from the last checkpoint.
 
-### 3. Smoke-test without network
+### 3. Telegram notifications
+
+    export TELEGRAM_BOT_TOKEN=...
+    export TELEGRAM_CHAT_ID=...
+
+    wqgp run ... --telegram
+
+Lifecycle events (run start, each generation's best fitness, run end)
+are pushed to the configured chat. If Telegram is unreachable, the
+run continues; only a warning is logged.
+
+### 4. Smoke-test without network
 
     wqgp run \
         --pool pool.json \
@@ -64,7 +75,7 @@ Re-running with the same `--run-id` resumes from the last checkpoint.
 
 `--dry-run` uses a deterministic fake evaluator. No credentials needed.
 
-### 4. Inspect runs
+### 5. Inspect runs
 
     wqgp list-runs --checkpoint-root ./checkpoints
 
@@ -112,6 +123,12 @@ Credentials are NOT accepted in the config file.
       transport.py                # HttpTransport, HttpResponse, RequestsTransport
       client.py                   # BrainCredentials, BrainSettings, BrainClient
       pool_builder.py             # PoolBuilder, OperatorSignatureTable
+    src/wqgp/notification/
+      __init__.py
+      events.py                   # RunStartEvent, GenerationEndEvent, RunEndEvent
+      protocol.py                 # Notifier Protocol
+      null.py                     # NullNotifier
+      telegram.py                 # TelegramNotifier, TelegramCredentials
     tests/
       _fakes.py                   # ScriptedTransport (shared test double)
       ...

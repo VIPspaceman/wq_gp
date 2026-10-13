@@ -2077,3 +2077,231 @@ a failure probability driven by the same hash. Keep it deterministic;
 do not introduce randomness.
 
 ---
+
+---
+
+## D-093 — Notifier is a Protocol; NullNotifier is the default
+
+**Decision**: `Notifier` is a `typing.Protocol` with three methods
+(`on_run_start`, `on_generation_end`, `on_run_end`). The default is
+`NullNotifier`, which does nothing. The Coordinator's constructor
+takes `notifier: Notifier | None = None` and stores a `NullNotifier`
+if given `None`.
+
+**Why**: two forces.
+
+(1) Structural typing lets tests pass a plain recording class without
+inheriting from an ABC. Same argument as `Evaluator` (D-033) and
+`HttpTransport` (D-071). Consistency across the codebase matters.
+
+(2) A default `NullNotifier` means the Coordinator's call sites are
+uniform: `self._notifier.on_run_start(event)` with no `if self._notifier
+is not None` anywhere. The branch-free code is easier to reason about
+and the null case has exactly one implementation, tested once.
+
+**Revisit if**: notifiers need configuration or lifecycle management
+(e.g. an async queue with a background drain thread). Then the Protocol
+gains a `start()`/`stop()` pair, and `NullNotifier` implements them as
+no-ops. Do NOT add those methods until there is a real consumer.
+
+---
+
+## D-094 — TelegramNotifier sends over HttpTransport
+
+**Decision**: `TelegramNotifier` takes an `HttpTransport` in its
+constructor. Production passes `RequestsTransport`; tests pass
+`ScriptedTransport`. The URL is constructed from the bot token; the
+body is JSON.
+
+**Why**: the same decision as `BrainClient` (D-071) and `PoolBuilder`
+(D-081). One abstraction, one test double, no monkeypatching. A new
+transport-dependent class is a non-event: the pattern is established
+and the tests look like every other transport-dependent test.
+
+The message body is plain text, not Markdown or HTML. Markdown escape
+rules in Telegram are strict and silently drop messages when unescaped
+metacharacters appear. Run ids and expression strings can contain
+those characters. Plain text removes a class of "why didn't I get a
+message" bugs.
+
+**Revisit if**: we need structured content (buttons, tables). Then
+the body becomes MarkdownV2 with a proper escaper, and the escaper
+gets its own tests. Do not "just add Markdown" without the escaper.
+
+---
+
+## D-095 — Notifications swallow their own exceptions
+
+**Decision**: every method on a Notifier swallows every exception it
+encounters, logs at WARNING level, and returns normally. The Coordinator
+adds a second layer of defense (`_safe_notify`), which catches anything
+that escapes and logs it.
+
+**Why**: a notification is an observation, not a dependency. If
+Telegram is down, or a network flake causes a timeout, the GP run must
+not be affected. The alternative — letting a notification error
+propagate — turns a cosmetic problem into a data-loss problem (an
+uncaught exception in the middle of a generation could lose a
+checkpoint write).
+
+The double layer is intentional: the Notifier's own `try/except` is
+the primary defense, and the Coordinator's `_safe_notify` catches the
+case where a notifier is missing the primary defense (e.g. a custom
+notifier written by a user). The two layers cost almost nothing and
+remove an entire class of "why did my run die when Telegram hiccupped"
+bug reports.
+
+This is the same principle as D-034 (the Executor swallows evaluator
+exceptions into FAILED records), applied to a different subsystem.
+
+**Revisit if**: we want to surface notification failures to the user
+visibly (e.g. exit non-zero if the final "run complete" message could
+not be sent). Then add a `strict: bool` flag to the notifier and a
+counter of failed sends. Do NOT remove the swallow; opt in to strict
+mode explicitly.
+
+---
+
+## D-096 — Events are frozen dataclasses, not strings
+
+**Decision**: `RunStartEvent`, `GenerationEndEvent`, `RunEndEvent` are
+frozen dataclasses with named fields. The Notifier receives the event
+object and is responsible for formatting.
+
+**Why**: string-building is a presentation concern; it belongs in the
+notifier, not the coordinator. A coordinator that builds "run alpha
+finished with sharpe 1.5..." has embedded Telegram-shaped text into
+the GP loop; swapping notifiers means editing the coordinator. Passing
+structured events keeps the coordinator ignorant of formatting.
+
+Frozen because a notifier must not be able to mutate the coordinator's
+view of the run. A notifier that could change an event's fields would
+be a back-channel mutation API, which is exactly what we do not want.
+
+The events deliberately exclude the population itself. A notifier
+that receives the full population could start making decisions based
+on it, or worse, mutate it. For debugging, the checkpoint and the
+evaluation store are the sources of truth. Events are a signal, not a
+snapshot.
+
+**Revisit if**: we add an event that carries the current best
+individual (e.g. for a "post the best alpha to a channel" feature).
+Then the event carries the individual's fingerprint and expression
+string, still not the Individual object. Keep the boundary: events
+are data about the run, not references into it.
+
+---
+
+## D-097 — Telegram credentials from environment only
+
+**Decision**: `TelegramCredentials.from_env()` reads
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. `TelegramCredentials`
+itself only takes them via its constructor; the CLI does not accept
+them as flags or config values.
+
+**Why**: same as D-089 for BRAIN credentials. A secret in a config
+file or a shell command is a secret in git or a shell history. The
+env-var path is the only one that a reasonable deployment can secure.
+
+The env-var names match the convention used by most Telegram bot
+libraries, so a user who already configured a bot for another tool
+does not need to learn a second set of names.
+
+**Revisit if**: multi-chat routing is needed (different runs to
+different chats). Then `TELEGRAM_CHAT_ID` becomes a per-run setting,
+which puts it in `RunConfig` — still read from env at the CLI layer,
+never accepted as a raw flag. That is a distinct feature; do not
+weaken this rule to support it.
+
+---
+
+## D-098 — Coordinator takes an optional notifier
+
+**Decision**: `Coordinator.__init__(config, evaluator, notifier=None)`.
+The CLI creates the notifier from `--telegram`; programmatic callers
+pass one explicitly or omit it.
+
+**Why**: the coordinator should not know what a Telegram is, and it
+should not read environment variables. Making the notifier an
+injected dependency keeps the coordinator testable without touching
+`os.environ` and keeps the notification transport decisions in the
+CLI (or in whatever program is embedding the coordinator).
+
+The CLI is the right place for `--telegram` because it is the only
+layer that already reads env vars for credentials (D-089) and already
+owns the argument-parsing surface. A future GUI or scheduler that
+embeds the Coordinator can pick its own notifier without a CLI flag.
+
+**Revisit if**: the coordinator needs to emit events to *multiple*
+notifiers (e.g. Telegram and a log file). Then the constructor takes
+`notifiers: Sequence[Notifier]`, and a `FanoutNotifier` composes them.
+Do NOT add a `notifier` field to `RunConfig`; config describes the
+run, not the observation of it.
+
+---
+
+---
+
+## D-099 — ScriptedTransport matches URLs by path suffix, not prefix
+
+**Decision**: `ScriptedTransport.request` matches the registered key
+against `urlparse(url).path` using `path.endswith(suffix)`. It does
+NOT use `startswith`.
+
+**Why**: two URL shapes are in play.
+
+- BRAIN: `https://api.worldquantbrain.com/authentication` → path
+  `/authentication`. Both `startswith` and `endswith` work.
+- Telegram: `https://api.telegram.org/bot<TOKEN>/sendMessage` → path
+  `/bot<TOKEN>/sendMessage`. Only `endswith` works; `startswith` fails
+  because the identifying segment is at the end.
+
+Switching to `endswith` is a superset for our cases: every BRAIN
+registration still matches (the registered prefix is the whole path
+there). It is also the right choice in general for REST-ish APIs:
+the resource identifier is almost always at the end of the path.
+
+The suffix rule does not introduce ambiguity when both a short and a
+long suffix are registered. `"/simulations/1".endswith("/simulations")`
+is `False`, so a specific registration cannot be shadowed by a shorter
+one. The method discriminator (`GET` vs `POST`) further separates the
+two endpoint families.
+
+**Revisit if**: an API introduces a query-string discriminator, e.g.
+`/simulations?type=REGULAR` vs `?type=BATCH`. Then registration keys
+become `(method, path_suffix, query_key, query_value)` tuples. Do NOT
+extend the current suffix scheme to cover query strings; the matching
+logic would become unreadable.
+
+---
+
+## D-100 — Resuming requires a prior next_generation, not just a checkpoint
+
+**Decision**: any test that asserts `RunStartEvent.resuming is True`
+must first run a prior Coordinator with `max_generations >= 2`. A
+`max_generations=1` prior run is not sufficient.
+
+**Why**: D-067 says a checkpoint captures the population the moment it
+is about to be evaluated, i.e. after a `next_generation` call. The
+initial setup writes a generation-0 checkpoint; every subsequent
+checkpoint is written after a `next_generation`. When
+`max_generations=1`, the loop evaluates generation 0 and then exits
+*before* calling `next_generation`, so no generation-1 checkpoint is
+written.
+
+The second run then loads the generation-0 checkpoint and reports
+`resuming=False`, `generation=0`, which is semantically correct: no
+progress was lost. The earlier test assumed "any prior run leaves a
+resumable checkpoint", which is not what the coordinator promises.
+
+This is not a bug in the coordinator. It is a property of the
+"checkpoint = pre-evaluation population" rule, and the test's premise
+was wrong about the boundary case.
+
+**Revisit if**: we change D-067 so that every generation boundary
+writes a checkpoint regardless of whether next_generation ran. Then
+this decision reverses. Do not reverse it without also revisiting
+D-067, because the two are the same invariant viewed from different
+angles.
+
+---

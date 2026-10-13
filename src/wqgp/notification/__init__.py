@@ -1,0 +1,1 @@
+"""Notification adapters for GP runs."""
