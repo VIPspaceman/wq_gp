@@ -1,11 +1,13 @@
 """Selection operators for the GP loop.
 
 Design decisions:
-- Selection is single-objective (fitness only). See D-059.
+- Selection defaults to single-objective (fitness only). See D-059.
 - Tournament sampling is without replacement. See D-060.
 - Elites are carried over unchanged; they are not mutated. See D-061.
 - next_generation is best-effort on size, hard-fail only if empty. See D-062.
 - Crossover requires two parents with distinct fingerprints. See D-063.
+- A `mode` field dispatches between single-objective and Pareto
+  selection without changing the default. See D-126.
 
 This module does NOT evaluate, does NOT talk to BRAIN, and does NOT
 mutate its inputs. It reads a Population and returns a new Population.
@@ -14,15 +16,20 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from typing import Callable
 
 from wqgp.crossover import Crossover, CrossoverError
 from wqgp.mutation import MutationError, Mutator
 from wqgp.population import Individual, Population
 
 
+# --- errors -----------------------------------------------------------------
+
 class SelectionError(RuntimeError):
     """Raised when selection cannot produce a new population."""
 
+
+# --- config -----------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
 class SelectionConfig:
@@ -34,12 +41,17 @@ class SelectionConfig:
       - tournament_size >= 1
       - 0.0 <= crossover_rate <= 1.0
       - max_breeding_attempts >= 1
+      - mode is "single" or "pareto"
+      - pareto_objectives, when mode="pareto", is either empty (use
+        defaults) or a tuple of (metric, direction) string pairs.
     """
     population_size: int
     elite_count: int = 2
     tournament_size: int = 3
     crossover_rate: float = 0.7
     max_breeding_attempts: int = 200
+    mode: str = "single"
+    pareto_objectives: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.population_size < 1:
@@ -60,6 +72,21 @@ class SelectionConfig:
             )
         if self.max_breeding_attempts < 1:
             raise ValueError("max_breeding_attempts must be >= 1")
+        if self.mode not in ("single", "pareto"):
+            raise ValueError(
+                f"mode must be 'single' or 'pareto', got {self.mode!r}"
+            )
+        for entry in self.pareto_objectives:
+            if (
+                not isinstance(entry, tuple)
+                or len(entry) != 2
+                or not isinstance(entry[0], str)
+                or not isinstance(entry[1], str)
+            ):
+                raise ValueError(
+                    f"pareto_objectives entries must be "
+                    f"(metric, direction) string pairs, got {entry!r}"
+                )
 
 
 # --- helpers ----------------------------------------------------------------
@@ -77,7 +104,7 @@ def _pick_best(candidates: list[Individual]) -> Individual:
     )
 
 
-# --- public operators -------------------------------------------------------
+# --- public operators (single-objective) ------------------------------------
 
 def tournament_select(
     population: Population,
@@ -118,19 +145,26 @@ def select_elites(
 
 # --- breeding ---------------------------------------------------------------
 
+TournamentFn = Callable[[], Individual]
+
+
 def _breed_one(
     parents: Population,
     mutator: Mutator,
     crossover: Crossover,
     config: SelectionConfig,
     rng: random.Random,
+    tournament_fn: TournamentFn,
 ) -> Individual | None:
     """Produce one offspring via crossover or mutation.
+
+    `tournament_fn` is supplied by the caller so that the same breeding
+    loop serves both single-objective and Pareto selection. See D-126.
 
     Returns None if the chosen path failed (e.g. no compatible swap,
     no mutation available). The caller retries.
     """
-    parent_a = tournament_select(parents, config.tournament_size, rng)
+    parent_a = tournament_fn()
 
     use_crossover = (
         rng.random() < config.crossover_rate and len(parents) >= 2
@@ -138,9 +172,7 @@ def _breed_one(
     parent_b: Individual | None = None
     if use_crossover:
         for _ in range(5):
-            candidate = tournament_select(
-                parents, config.tournament_size, rng
-            )
+            candidate = tournament_fn()
             if candidate.fingerprint != parent_a.fingerprint:
                 parent_b = candidate
                 break
@@ -172,6 +204,37 @@ def _breed_one(
     )
 
 
+def _resolve_pareto_config(
+    config: SelectionConfig,
+):
+    """Build a ParetoConfig from SelectionConfig's pareto_objectives.
+
+    Imported lazily so that `selection` does not require `pareto` at
+    module load time. See D-126.
+    """
+    from wqgp.pareto import (
+        DEFAULT_OBJECTIVES,
+        Objective,
+        ObjectiveDirection,
+        ParetoConfig,
+    )
+
+    if not config.pareto_objectives:
+        return ParetoConfig(DEFAULT_OBJECTIVES)
+
+    objectives: list[Objective] = []
+    for metric, direction_str in config.pareto_objectives:
+        try:
+            direction = ObjectiveDirection(direction_str)
+        except ValueError as e:
+            raise SelectionError(
+                f"invalid pareto direction {direction_str!r}; "
+                f"expected MAXIMIZE or MINIMIZE"
+            ) from e
+        objectives.append(Objective(metric, direction))
+    return ParetoConfig(tuple(objectives))
+
+
 def next_generation(
     parents: Population,
     mutator: Mutator,
@@ -194,7 +257,30 @@ def next_generation(
     if len(parents) == 0:
         raise SelectionError("cannot evolve an empty population")
 
-    elites = select_elites(parents, config.elite_count)
+    if config.mode == "single":
+        elites = select_elites(parents, config.elite_count)
+
+        def tournament_fn() -> Individual:
+            return tournament_select(
+                parents, config.tournament_size, rng
+            )
+    elif config.mode == "pareto":
+        from wqgp.pareto import ParetoSelector
+
+        selector = ParetoSelector(_resolve_pareto_config(config))
+        ranking = selector.prepare(parents)
+        elites = selector.select_elites(
+            parents, ranking, config.elite_count
+        )
+
+        def tournament_fn() -> Individual:
+            return selector.tournament_select(
+                parents, ranking, config.tournament_size, rng
+            )
+    else:
+        # Unreachable: SelectionConfig.__post_init__ validated mode.
+        raise SelectionError(f"unknown selection mode: {config.mode!r}")
+
     result: list[Individual] = list(elites)
     seen: set[str] = {i.fingerprint for i in elites}
 
@@ -204,7 +290,9 @@ def next_generation(
         and attempts < config.max_breeding_attempts
     ):
         attempts += 1
-        child = _breed_one(parents, mutator, crossover, config, rng)
+        child = _breed_one(
+            parents, mutator, crossover, config, rng, tournament_fn
+        )
         if child is None:
             continue
         if child.fingerprint in seen:

@@ -3137,3 +3137,183 @@ gains a `retryable: bool` field, and `_merge_evaluations` only
 propagates terminal ones. Do NOT relax the finite-number check.
 
 ---
+
+---
+
+## D-126 — Pareto selection is opt-in via SelectionConfig.mode
+
+**Decision**: `SelectionConfig` gains a `mode` field defaulting to
+`"single"`. `next_generation` dispatches on it. `"single"` runs the
+existing tournament + elitism path unchanged; `"pareto"` uses the new
+`ParetoSelector`. The two paths share the breeding loop through a
+`tournament_fn` callable, so mutation/crossover behavior is identical.
+
+**Why**: existing behavior must not change. `mode="single"` is the
+default so every existing test and every existing run continues to
+work with zero configuration. Adding a second mode is a pure opt-in.
+
+The dispatch lives in `next_generation` rather than in the caller for
+one reason: the elites selection and the tournament selection must
+agree on the same ranking. If a caller picked one and `next_generation`
+picked the other, the population would be built from two
+incompatible orderings.
+
+`pareto` is imported lazily inside the `mode == "pareto"` branch. This
+keeps `selection.py` importable even if `pareto.py` has an error, and
+avoids a module-level cycle risk if pareto ever needs a selection
+helper.
+
+**Revisit if**: a third mode appears (e.g. novelty search, lexicase).
+Then the dispatch becomes a small registry mapping mode name to a
+`SelectorFactory`. Do NOT extend the if/elif chain.
+
+---
+
+## D-127 — Objectives carry an explicit direction
+
+**Decision**: `Objective` is a frozen dataclass with `metric: str` and
+`direction: ObjectiveDirection` (`MAXIMIZE` or `MINIMIZE`). There is
+no "maximized by convention" rule for any metric.
+
+**Why**: turnover is not "negative fitness". A user reading the
+config should see `("turnover", "MINIMIZE")` and understand
+immediately what is optimized, rather than remembering that the
+internal representation negates it. The dominance function checks the
+direction on every comparison, which is a handful of nanoseconds per
+pair and buys clarity at every layer above.
+
+The alternative — storing a signed weight — was rejected because
+weighting and direction are different concepts. A weighted objective
+says "this matters more"; a direction says "smaller is better". Fold
+them into one number and neither is expressible clearly.
+
+**Revisit if**: weighted objectives are needed (e.g. sharpe counts
+twice). Then `Objective` gains a `weight: float = 1.0` field that
+scales the difference in dominance comparisons. Do NOT encode weight
+as sign.
+
+---
+
+## D-128 — Missing metrics rank worst, not excluded
+
+**Decision**: when an `Objective` cannot find its metric on an
+`Individual`, `extract` returns `-inf` for MAXIMIZE and `+inf` for
+MINIMIZE. The individual is not excluded from the front; it simply
+ends up dominated by everyone who has the metric.
+
+**Why**: excluding unevaluated individuals from the population would
+require mutating the population structure mid-selection, and would
+break the invariant that every member has a front index in
+`ParetoRanking`. Returning a sentinel keeps the algorithm uniform: a
+missing metric is just a very bad value.
+
+The sentinel is `-inf`/`+inf` rather than a finite number so it cannot
+accidentally beat a real value. `math.inf` sorts as larger than any
+finite float, which is exactly the semantics we want on both
+directions.
+
+A special case: `metric == "sharpe"` falls back to
+`Individual.fitness`. This is because the default `FitnessFunction`
+returns the sharpe, so `fitness` and the `sharpe` metric carry the
+same value when both are present, and the fallback avoids treating
+pre-metrics individuals (e.g. from an old checkpoint) as if they had
+no sharpe at all.
+
+**Revisit if**: a metric becomes optional but "missing" should mean
+"neutral" (e.g. an objective that only applies to some regions). Then
+`Objective` gains a `default: float | None` field and the sentinel is
+used only when the default is also missing.
+
+---
+
+## D-129 — Crowding distance uses the NSGA-II formulation
+
+**Decision**: `_crowding_distance` sorts each front by each objective
+value independently, assigns `math.inf` to the two boundary
+individuals, and adds the normalized neighbor gap
+`(v[k+1] - v[k-1]) / (v_max - v_min)` to interior individuals. The
+direction of the objective is ignored in this computation.
+
+**Why**: the crowding distance measures how isolated an individual is
+along each objective axis. "Isolated" is symmetric in direction: a
+point is far from its neighbors whether its neighbors are larger or
+smaller. Sorting ascending and taking `v[k+1] - v[k-1]` gives the
+same magnitude regardless of MAXIMIZE vs MINIMIZE, which is the
+correct behavior.
+
+Assigning `inf` to boundaries is what makes NSGA-II keep the extremes
+of the Pareto front. Without it, extreme points would have near-zero
+crowding and be dropped by the next truncation, collapsing the front
+inward.
+
+If a front has fewer than 3 members, or if an objective has zero range
+within the front (all values equal), every member gets `inf`. That
+matches NSGA-II: there is no meaningful "interior" to reward.
+
+**Revisit if**: a large number of objectives (4+) makes crowding
+distance ineffective. That is a known limitation of NSGA-II; the fix
+is a reference-point algorithm (NSGA-III, RVEA), which is a
+substantial redesign. Do not attempt it until a 4-objective run is
+actually in use.
+
+---
+
+## D-130 — Ranking is precomputed once per generation
+
+**Decision**: `ParetoSelector.prepare(population)` computes the front
+index and crowding distance for every member once, and returns a
+`ParetoRanking`. `select_elites` and `tournament_select` take that
+ranking as a parameter and do not recompute it.
+
+**Why**: the non-dominated sort is `O(n^2 * m)` (n individuals, m
+objectives). Tournament selection is called dozens of times per
+generation; recomputing the ranking on each call would multiply the
+cost of the whole generation by that factor. One prepare call per
+generation is a fixed cost that is negligible relative to the
+`O(n^2)` algorithm.
+
+The ranking is a frozen dataclass with `MappingProxyType` wrappers, so
+no caller can mutate it. This matches the pattern of `Population` and
+other shared value objects in this project.
+
+**Revisit if**: a generation needs to add or remove individuals after
+ranking (e.g. online learning). Then the ranking must be invalidated
+and recomputed; make that explicit by having the mutation return a new
+`ParetoRanking`. Do NOT make the ranking lazy or cached internally —
+that invites stale-ranking bugs.
+
+---
+
+---
+
+## D-131 — Crowding tests must use mutually non-dominating inputs
+
+**Decision**: any test that asserts on crowding distance within a
+single front must use input values where no individual dominates
+another. The naive pattern "sharpe ascending, turnover descending"
+produces three separate fronts, each with one member; the crowding
+distance of a single-member front is trivially `inf`.
+
+**Why**: the first version of `test_crowding_boundary_individuals_get_infinity`
+used `a=(3.0, 0.1)`, `b=(2.0, 0.3)`, `c=(1.0, 0.5)` and expected a
+single 3-member front. In fact a dominates b dominates c, so the
+fronts were `{a}`, `{b}`, `{c}` and every member got `inf`. The test
+asserted `math.isfinite(...)` on b and failed with `inf`.
+
+The failure was in the test, not the selector. `_crowding_distance`
+correctly returns `inf` for fronts of size <= 2, because there is no
+meaningful interior to reward. To exercise the interior case, the
+inputs must be constructed so that no individual weakly dominates
+another on every objective.
+
+The correct construction for a 3-member front with two objectives is
+to correlate the two metrics so improvements on one always cost the
+other: high sharpe comes with high turnover, low sharpe with low
+turnover. Then a vs b, b vs c, and a vs c each trade off one metric
+against the other, and all three land in front 0.
+
+**Revisit if**: a test legitimately wants to verify the single-member
+front case. Then it should assert `crowding == math.inf` directly,
+not `isfinite`. That is a different test with a different name.
+
+---

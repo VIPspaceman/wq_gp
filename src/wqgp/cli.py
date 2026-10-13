@@ -303,6 +303,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--tournament-size", type=int, default=None)
     p_run.add_argument("--crossover-rate", type=float, default=None)
     p_run.add_argument("--max-breeding-attempts", type=int, default=None)
+    p_run.add_argument(
+        "--mode",
+        choices=("single", "pareto"),
+        default=None,
+        help=(
+            "selection mode: 'single' (sharpe only) or 'pareto' "
+            "(multi-objective). Default from config, else 'single'."
+        ),
+    )
     p_run.add_argument("--seed", type=int, default=None)
     p_run.add_argument("--max-generations", type=int, default=None)
     p_run.add_argument("--checkpoint-root", default=None)
@@ -486,6 +495,23 @@ def _resolve_selection(
     s = cfg.get("selection", {})
     if not isinstance(s, dict):
         raise CliError("config 'selection' must be an object")
+
+    mode = _pick(args, s, "mode", "mode", "single")
+
+    raw_objectives = s.get("pareto_objectives", ())
+    if not isinstance(raw_objectives, (list, tuple)):
+        raise CliError("selection.pareto_objectives must be a list")
+    pareto_objectives: list[tuple[str, str]] = []
+    for entry in raw_objectives:
+        if (
+            not isinstance(entry, (list, tuple))
+            or len(entry) != 2
+        ):
+            raise CliError(
+                "each pareto_objectives entry must be [metric, direction]"
+            )
+        pareto_objectives.append((str(entry[0]), str(entry[1])))
+
     return SelectionConfig(
         population_size=int(
             _pick(args, s, "population_size", "population_size", 20)
@@ -505,6 +531,8 @@ def _resolve_selection(
                 "max_breeding_attempts", 200,
             )
         ),
+        mode=str(mode),
+        pareto_objectives=tuple(pareto_objectives),
     )
 
 

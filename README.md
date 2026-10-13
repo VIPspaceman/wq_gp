@@ -68,6 +68,35 @@ not present in the table are dropped and reported.
 
 Re-running with the same `--run-id` resumes from the last checkpoint.
 
+### Multi-objective selection
+
+By default, selection ranks by sharpe only. To select on a Pareto
+front over multiple metrics:
+
+    wqgp run \
+        --pool pool.json \
+        --run-id pareto_run \
+        --total-simulations 1000 \
+        --mode pareto
+
+Or in a config file:
+
+    {
+      "selection": {
+        "population_size": 20,
+        "elite_count": 4,
+        "mode": "pareto",
+        "pareto_objectives": [
+          ["sharpe", "MAXIMIZE"],
+          ["turnover", "MINIMIZE"]
+        ]
+      }
+    }
+
+The default objectives, when `pareto_objectives` is omitted, are
+`sharpe` (maximize) and `turnover` (minimize). Both metrics are stored
+in the evaluation record by the default BrainClient.
+
 ### 4. Telegram notifications
 
     export TELEGRAM_BOT_TOKEN=...
