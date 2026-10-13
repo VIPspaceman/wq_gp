@@ -2814,3 +2814,213 @@ the HTTP standard is the safer default.
 **Revisit if**: BRAIN starts returning 202 with a meaningful body
 (e.g. a queue position). Then that body is parsed in the 202 branch;
 do not move the branch order back.
+
+---
+
+## D-115 — Progress logging at INFO in Coordinator and BrainClient
+
+**Decision**: the Coordinator logs one INFO line per generation
+(submissions count and post-evaluation summary). BrainClient logs at
+DEBUG on submit, on poll completion, and on alpha metric fetch.
+
+**Why**: a user watching a real run asked "why is nothing happening"
+because the only output between "starting new run" and "run finished"
+was silence for 15 minutes. Real simulations take 2-3 minutes each;
+without progress logs, the process looks hung.
+
+INFO for the Coordinator is the right level: one or two lines per
+generation is a manageable summary. DEBUG for BrainClient keeps the
+per-simulation noise off unless someone is debugging a specific
+failure; a 30-generation run with 20 individuals each would otherwise
+print 600+ lines at INFO.
+
+**Revisit if**: INFO becomes too sparse for long generations, or DEBUG
+becomes too noisy even for debugging. Then split into a `wqgp.progress`
+logger that stays at INFO, and move everything else to DEBUG.
+
+---
+
+## D-116 — LoggingSettings is structured, not a single level
+
+**Decision**: `LoggingSettings` carries `level`, `style`,
+`components` (per-logger overrides), and `file`. Style is a name from
+a fixed set (`default`, `compact`, `minimal`), not a raw Python
+format string.
+
+**Why**: a single `level` field is what the reference project has,
+and it was the immediate cause of a user request for more control.
+Two concrete needs appeared:
+
+1. "Show me what BrainClient is doing, but not the executor's retry
+   noise" — solved by per-component levels, using Python's logging
+   hierarchy.
+2. "Different output when I'm watching versus logging to a file" —
+   solved by named styles instead of format strings.
+
+Exposing Python's `%(...)s` format syntax in a JSON file is a footgun:
+a typo silently produces broken output, and the user has to learn a
+Python-internal DSL. Named styles give three useful shapes and take
+one line to extend later.
+
+**Revisit if**: someone needs a style we don't ship. Add it to
+`_STYLES` and document it. Do NOT open up raw format strings in the
+config.
+
+---
+
+## D-117 — One JSON file with a `logging` block and a `defaults` block
+
+**Decision**: `Settings` reads a single JSON file. The file has two
+accepted top-level keys: `logging` (a `LoggingSettings` dict) and
+`defaults` (a `DefaultsSettings` dict). Unknown top-level keys are
+rejected with a clear error.
+
+**Why**: the user asked for "one settings file controlling
+everything". A single file with two well-scoped blocks is the minimal
+answer. It does not try to absorb every existing config object
+(`RunConfig`, `Budget`, `SelectionConfig` stay where they are) —
+those have different lifetimes and different owners.
+
+The `defaults` block is deliberately narrow. It carries values that
+are usually the same across runs: BRAIN region/universe/delay,
+concurrency, seed, generation cap, checkpoint root. It does NOT carry
+`run_id`, `pool_path`, or budget limits — those change per run and
+must be supplied on the command line or in a per-run config.
+
+Rejecting unknown keys is a deliberate strictness. A typo'd
+`"loging"` block would otherwise be silently ignored, and the user
+would wonder why their log level had no effect.
+
+**Revisit if**: the file needs a third block (e.g. a `notifications`
+block for Telegram). Add the key to the known set and to `Settings`.
+Do NOT switch to "accept any key and warn"; the strict version has
+already prevented a typo class.
+
+---
+
+## D-118 — CLI flag beats file; file beats code default
+
+**Decision**: the `--log-level` flag, when present, overrides
+`logging.level` from the config file. When `--log-level` is absent,
+the file's value is used. When the file is absent, `LoggingSettings()`
+defaults apply. The same rule applies to every `defaults` field: a
+CLI flag overrides the file, the file overrides the code default.
+
+**Why**: this is the same precedence rule the CLI already uses for
+per-run flags (D-088), extended to the new config blocks. One rule,
+one place to reason about it.
+
+Implementation detail: `--log-level` has `default=None` rather than
+`default="INFO"`. `None` means "not given", so the resolver can tell
+"user explicitly asked for INFO" apart from "user said nothing". If
+the flag were `default="INFO"`, the file's `"level": "DEBUG"` would
+never take effect.
+
+**Revisit if**: we add environment variables as a third layer.
+Precedence would become flag > env > file > default. That is a
+reasonable extension; add it here and in one resolver.
+
+---
+
+## D-119 — Component log levels use Python's logger hierarchy
+
+**Decision**: `logging.components` is a mapping from logger name to
+level. Names may be full (`wqgp.brain.client`) or prefixes (`wqgp`).
+The setup function calls `logging.getLogger(name).setLevel(...)` for
+each entry, after resetting any previously set overrides to NOTSET.
+
+**Why**: Python's logging module already implements hierarchical
+level resolution: a child logger inherits its parent's effective level
+unless it has its own. Delegating to that mechanism means we do not
+have to write a matcher, a fallback chain, or any custom dispatch —
+one `setLevel` call per entry and the standard library does the rest.
+
+The reset step is important. Without it, removing an override from
+the config (e.g. changing `wqgp.brain.client` from DEBUG back to
+unset) has no effect on a long-running process that already called
+`setup_logging` once. The `_LAST_OVERRIDES` set tracks which loggers
+we touched, so the next call can reset exactly those and only those.
+
+**Revisit if**: we need per-handler filtering (different levels for
+stderr vs file). Then `setup_logging` gains two lists, one per
+handler, and each handler gets `logging.Filter` instances. Do NOT
+invent a custom filter language on top of the config; filters are
+already a Python concept.
+
+---
+
+---
+
+## D-120 — _load_settings uses getattr for the optional --config flag
+
+**Decision**: `_load_settings` reads `--config` (and `--log-level`)
+via `getattr(args, name, None)`. Subcommands that do not define
+`--config` (`build-pool`, `list-runs`, `signatures`) work unchanged.
+
+**Why**: `--config` is defined only on the `run` subcommand. After
+D-115..D-119 introduced a global settings load in `main`, reading
+`args.config` directly raised `AttributeError` for every subcommand
+that lacked the flag. Six CLI tests failed with exit code 1 because
+`main`'s catch-all handler converted the `AttributeError` to
+`EXIT_ERROR`.
+
+The alternative — adding `--config` to every subcommand — was
+rejected for now because it changes the CLI surface for subcommands
+that have no use for the `defaults` block. `list-runs` reads its
+checkpoint root from a flag; the settings file would add nothing.
+
+**Revisit if**: we decide all subcommands should honor the settings
+file's `defaults` block (e.g. `build-pool` picking up
+region/universe from the file). Then add `--config` to the shared
+`common` parent parser and remove the `getattr` fallback. That is a
+deliberate CLI expansion, not a bug fix.
+
+---
+
+---
+
+## D-121 — Settings ignores unknown top-level keys
+
+**Decision**: `Settings.from_dict` reads the `logging` and `defaults`
+blocks and ignores every other top-level key. Unknown keys INSIDE
+`logging` or `defaults` are still rejected.
+
+**Why**: the same JSON file is read by two loaders:
+
+1. `Settings` (via `main` → `_load_settings`) for `logging` and
+   `defaults`.
+2. `_load_config` (in `_cmd_run`) for run-level keys: `run_id`,
+   `pool_path`, `budget`, `selection`, etc.
+
+D-117 made `Settings` reject unknown top-level keys, which caused
+both loaders to fight over the file: `_cmd_run` wanted
+`run_id` / `pool_path` at the top level, and `Settings` rejected them
+with "unknown top-level settings keys: [...]". Two CLI tests failed
+immediately, and every user who put run-level keys in `--config`
+would have hit the same error.
+
+Relaxing the top level is the minimal fix that keeps the useful part
+of D-117's strictness. A typo'd `"loging"` block is still caught
+because the unknown key would appear... wait, no. If the top level is
+lenient, `"loging": {"level": "DEBUG"}` is silently ignored.
+
+This is a real downside. The trade-off:
+
+- Strict top level: catches "loging" typos, but forces users to split
+  their config into two files.
+- Lenient top level: single file works, but a typo'd block is silent.
+
+We chose lenient because splitting the file is a bigger usability
+cost than a silent typo that is easy to notice (the log level simply
+does not change; the user investigates; the typo is found in five
+seconds). The `logging` block's own keys are still strict, which
+catches `"levl"` once the user gets into the block.
+
+**Revisit if**: users repeatedly hit the silent-typo case. Then
+`Settings.load` can log a warning for any top-level key that is not
+in the recognized set and not in the run-config's known set. That
+keeps one file while restoring a signal for typos. Do NOT re-tighten
+the top level without also splitting the CLI flag into `--settings`
+and `--run-config`.
+
+---

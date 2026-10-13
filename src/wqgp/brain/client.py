@@ -29,6 +29,7 @@ Design decisions:
 from __future__ import annotations
 
 import os
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ from wqgp.brain.transport import (
     TransportError,
 )
 from wqgp.execution import Task, TaskResult, TaskStatus
+log = logging.getLogger(__name__)
 
 
 # --- errors -----------------------------------------------------------------
@@ -385,6 +387,7 @@ class BrainClient:
             raise BrainProtocolError(
                 "submit response missing Location header"
             )
+        log.debug("[submit] %s -> %s", expression[:80], location)
         return location
 
     def _poll(self, sim_url: str) -> SimulationResult:
@@ -476,6 +479,7 @@ class BrainClient:
                     raise BrainProtocolError(
                         "COMPLETE response without 'alpha' id"
                     )
+                log.debug("[poll] complete alpha=%s", alpha_id)
                 return self._fetch_alpha_metrics(alpha_id)
 
             # ---- No status: {"progress": float}, keep waiting ----
@@ -527,6 +531,7 @@ class BrainClient:
             if isinstance(v, (int, float)):
                 metrics.append((str(k), float(v)))
 
+        log.debug("[alpha] %s metrics=%d", alpha_id, len(metrics))
         return SimulationResult(
             alpha_id=alpha_id,
             metrics=tuple(metrics),

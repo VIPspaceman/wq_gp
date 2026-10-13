@@ -375,3 +375,57 @@ def test_list_runs_shows_runs(capsys, tmp_path: Path) -> None:
     captured = capsys.readouterr()
     assert "alpha" in captured.out
     assert "beta" in captured.out
+
+def test_list_runs_works_without_config_flag(
+    capsys, tmp_path: Path,
+) -> None:
+    """Subcommands that do not accept --config must still work.
+
+    Regression test for D-120: when _load_settings started reading
+    args.config directly, every subcommand without the flag failed
+    with an AttributeError converted to EXIT_ERROR.
+    """
+    root = tmp_path / "ckpt"
+    root.mkdir()
+    code = cli.main([
+        "list-runs", "--checkpoint-root", str(root),
+    ])
+    assert code == cli.EXIT_OK
+
+
+def test_build_pool_works_without_config_flag(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Same as above, for the build-pool subcommand."""
+    _set_creds(monkeypatch)
+
+    scripted = ScriptedTransport()
+    scripted.expect(
+        "POST", "/authentication",
+        make_response(201, json_body={"user": "u"}),
+    )
+    scripted.expect(
+        "GET", "/data-fields",
+        make_response(200, json_body=[
+            {"id": "close", "type": "MATRIX", "dataset": "pv1",
+             "coverage": 0.99, "delay": 1},
+        ]),
+    )
+    scripted.expect(
+        "GET", "/operators",
+        make_response(200, json_body=[{"name": "add"}]),
+    )
+    monkeypatch.setattr(
+        cli, "_make_transport", lambda args: scripted
+    )
+
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps(_signatures_payload()))
+    out_path = tmp_path / "pool.json"
+
+    code = cli.main([
+        "build-pool",
+        "--signatures", str(sig_path),
+        "--output", str(out_path),
+    ])
+    assert code == cli.EXIT_OK

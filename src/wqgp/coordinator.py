@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import logging
 import random
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 from wqgp._ids import validate_run_id
+log = logging.getLogger(__name__)
 from wqgp.ast import render as render_ast
 from wqgp.budget import Budget, BudgetTracker
 from wqgp.checkpoint import Checkpoint, CheckpointStore
@@ -195,8 +197,25 @@ class Coordinator:
                 last_generation = generation
 
                 pop = self._merge_evaluations(pop)
+                pending = sum(
+                    1 for i in pop
+                    if not i.is_evaluated()
+                    and i.status is not EvaluationStatus.FAILED
+                )
+                log.info(
+                    "[%s] gen %d: submitting %d individuals",
+                    self._config.run_id, generation, pending,
+                )
                 self._evaluate(executor, pop, tracker)
                 pop = self._merge_evaluations(pop)
+                best = self._best_fitness(pop)
+                best_str = "n/a" if best is None else f"{best:.4f}"
+                log.info(
+                    "[%s] gen %d: evaluated=%d best=%s sims_used=%d",
+                    self._config.run_id, generation,
+                    len(pop.evaluated()), best_str,
+                    tracker.total_simulations_used,
+                )
 
                 if tracker.is_exhausted():
                     stopped_reason = "budget_exhausted"

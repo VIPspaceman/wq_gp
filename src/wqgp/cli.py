@@ -53,9 +53,11 @@ from wqgp.notification.telegram import (
     TelegramCredentials,
     TelegramNotifier,
 )
+from wqgp.logging_setup import LoggingSettings, setup_logging
 from wqgp.pool import Pool, PoolError
 from wqgp.selection import SelectionConfig
 from wqgp.serialization import SerializationError
+from wqgp.settings import Settings
 from wqgp.signatures_audit import (
     SignatureAudit,
     audit_signatures,
@@ -86,15 +88,36 @@ class CliError(RuntimeError):
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
-def _setup_logging(level_name: str) -> None:
-    level = getattr(logging, level_name.upper(), None)
-    if not isinstance(level, int):
-        raise CliError(f"unknown log level: {level_name!r}")
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+def _load_settings(args: argparse.Namespace) -> Settings:
+    """Load the settings file, if --config was given.
+
+    The `--log-level` flag overrides the file's logging.level.
+
+    `--config` is defined only on the `run` subcommand; other
+    subcommands (build-pool, list-runs, signatures) do not accept it.
+    We read it via getattr so those subcommands work unchanged.
+    See D-120.
+    """
+    config_path = getattr(args, "config", None)
+    try:
+        settings = Settings.load(config_path)
+    except (FileNotFoundError, ValueError) as e:
+        raise CliError(str(e)) from e
+
+    log_level = getattr(args, "log_level", None)
+    if log_level is not None:
+        # Rebuild logging block with the flag's level.
+        settings = Settings(
+            logging=LoggingSettings(
+                level=log_level,
+                style=settings.logging.style,
+                components=settings.logging.components,
+                file=settings.logging.file,
+            ),
+            defaults=settings.defaults,
+            raw=settings.raw,
+        )
+    return settings
 
 
 # --- transport factory (patched in tests) -----------------------------------
@@ -199,9 +222,12 @@ def _build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--log-level",
-        default="INFO",
+        default=None,
         choices=_LOG_LEVELS,
-        help="logging verbosity (default: INFO)",
+        help=(
+            "override the config file's logging.level "
+            "(default: value from config, or INFO)"
+        ),
     )
 
     parser = argparse.ArgumentParser(
@@ -484,6 +510,7 @@ def _resolve_selection(
 
 def _cmd_run(args: argparse.Namespace) -> int:
     cfg = _load_config(Path(args.config) if args.config else None)
+    defaults = args._settings.defaults
 
     pool_raw = _pick(args, cfg, "pool", "pool_path", None)
     if pool_raw is None:
@@ -507,20 +534,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
         pool=pool,
         budget=_resolve_budget(args, cfg),
         selection=_resolve_selection(args, cfg),
-        seed=int(_pick(args, cfg, "seed", "seed", 42)),
+        seed=int(_pick(args, cfg, "seed", "seed", defaults.seed)),
         max_generations=int(
-            _pick(args, cfg, "max_generations", "max_generations", 10)
+            _pick(
+                args, cfg, "max_generations", "max_generations",
+                defaults.max_generations,
+            )
         ),
         checkpoint_root=Path(
             _pick(
                 args, cfg, "checkpoint_root",
-                "checkpoint_root", "./checkpoints",
+                "checkpoint_root", defaults.checkpoint_root,
             )
         ),
         evaluation_db=(
             None if eval_db_raw is None else Path(eval_db_raw)
         ),
-        n_workers=int(_pick(args, cfg, "n_workers", "n_workers", 4)),
+        n_workers=int(
+            _pick(args, cfg, "n_workers", "n_workers", defaults.n_workers)
+        ),
         initial_population_size=(
             None if init_pop_raw is None else int(init_pop_raw)
         ),
@@ -659,7 +691,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     try:
-        _setup_logging(args.log_level)
+        settings = _load_settings(args)
+        setup_logging(settings.logging)
+        # Stash for handlers that need the defaults block.
+        args._settings = settings
         return args.handler(args)
     except CliError as e:
         log.error("%s", e)

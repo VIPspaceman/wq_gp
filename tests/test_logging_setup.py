@@ -1,0 +1,193 @@
+"""Tests for structured logging configuration. Phase 4 Step 5 gate."""
+from __future__ import annotations
+
+import logging
+import json
+from pathlib import Path
+
+import pytest
+
+from wqgp.logging_setup import (
+    LoggingSettings,
+    setup_logging,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_loggers():
+    """Reset root and component loggers between tests."""
+    yield
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(logging.WARNING)
+    for name in ("wqgp", "wqgp.brain", "wqgp.brain.client",
+                 "wqgp.execution", "wqgp.coordinator"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+
+# --- LoggingSettings validation --------------------------------------------
+
+def test_settings_default() -> None:
+    s = LoggingSettings()
+    assert s.level == "INFO"
+    assert s.style == "default"
+    assert s.components == ()
+    assert s.file is None
+
+
+def test_settings_rejects_unknown_level() -> None:
+    with pytest.raises(ValueError):
+        LoggingSettings(level="BOGUS")
+
+
+def test_settings_rejects_unknown_style() -> None:
+    with pytest.raises(ValueError):
+        LoggingSettings(style="fancy")
+
+
+def test_settings_rejects_empty_component_name() -> None:
+    with pytest.raises(ValueError):
+        LoggingSettings(components=(("", "DEBUG"),))
+
+
+def test_settings_rejects_bad_component_level() -> None:
+    with pytest.raises(ValueError):
+        LoggingSettings(components=(("wqgp", "LOUD"),))
+
+
+def test_settings_level_is_case_insensitive() -> None:
+    s = LoggingSettings(level="info", components=(("wqgp", "debug"),))
+    assert s.level == "info"  # stored as-is
+    setup_logging(s)  # no error
+
+
+# --- from_dict --------------------------------------------------------------
+
+def test_from_dict_empty() -> None:
+    s = LoggingSettings.from_dict({})
+    assert s.level == "INFO"
+
+
+def test_from_dict_full() -> None:
+    s = LoggingSettings.from_dict({
+        "level": "DEBUG",
+        "style": "compact",
+        "components": {"wqgp.brain.client": "DEBUG"},
+        "file": "/tmp/x.log",
+    })
+    assert s.level == "DEBUG"
+    assert s.style == "compact"
+    assert s.components == (("wqgp.brain.client", "DEBUG"),)
+    assert s.file == "/tmp/x.log"
+
+
+def test_from_dict_rejects_unknown_key() -> None:
+    with pytest.raises(ValueError):
+        LoggingSettings.from_dict({"levl": "INFO"})
+
+
+def test_from_dict_rejects_non_dict() -> None:
+    with pytest.raises(ValueError):
+        LoggingSettings.from_dict([1, 2, 3])  # type: ignore[arg-type]
+
+
+def test_from_dict_rejects_bad_components_type() -> None:
+    with pytest.raises(ValueError):
+        LoggingSettings.from_dict({"components": ["wqgp"]})
+
+
+# --- setup_logging ----------------------------------------------------------
+
+def test_setup_sets_root_level() -> None:
+    setup_logging(LoggingSettings(level="DEBUG"))
+    assert logging.getLogger().level == logging.DEBUG
+
+
+def test_setup_installs_stderr_handler() -> None:
+    setup_logging(LoggingSettings())
+    root = logging.getLogger()
+    assert any(
+        isinstance(h, logging.StreamHandler)
+        for h in root.handlers
+    )
+
+
+def test_setup_applies_component_level() -> None:
+    setup_logging(LoggingSettings(
+        level="INFO",
+        components=(("wqgp.brain.client", "DEBUG"),),
+    ))
+    assert (
+        logging.getLogger("wqgp.brain.client").level == logging.DEBUG
+    )
+    # A sibling logger is not affected.
+    assert (
+        logging.getLogger("wqgp.execution").level
+        == logging.NOTSET
+    )
+
+
+def test_setup_resets_stale_component_overrides() -> None:
+    """Removing an override from the config takes effect on the next
+    setup call."""
+    setup_logging(LoggingSettings(
+        components=(("wqgp.brain", "DEBUG"),),
+    ))
+    assert logging.getLogger("wqgp.brain").level == logging.DEBUG
+
+    setup_logging(LoggingSettings())  # no components
+    assert logging.getLogger("wqgp.brain").level == logging.NOTSET
+
+
+def test_setup_is_idempotent() -> None:
+    setup_logging(LoggingSettings())
+    setup_logging(LoggingSettings())
+    root = logging.getLogger()
+    stream_handlers = [
+        h for h in root.handlers
+        if isinstance(h, logging.StreamHandler)
+        and not isinstance(h, logging.FileHandler)
+    ]
+    assert len(stream_handlers) == 1
+
+
+def test_setup_writes_to_file(tmp_path: Path) -> None:
+    log_path = tmp_path / "wqgp.log"
+    setup_logging(LoggingSettings(file=str(log_path)))
+    logging.getLogger("wqgp.test").warning("hello file")
+    for h in logging.getLogger().handlers:
+        h.flush()
+    assert log_path.exists()
+    assert "hello file" in log_path.read_text(encoding="utf-8")
+
+
+def test_setup_creates_parent_dir_for_file(tmp_path: Path) -> None:
+    log_path = tmp_path / "nested" / "dir" / "wqgp.log"
+    setup_logging(LoggingSettings(file=str(log_path)))
+    assert log_path.parent.exists()
+
+
+def test_compact_style_omits_timestamp(caplog) -> None:
+    setup_logging(LoggingSettings(style="compact"))
+    logger = logging.getLogger("wqgp.test")
+    with caplog.at_level(logging.INFO):
+        logger.info("hi")
+    # caplog captures via its own handler; check the formatter applied
+    # by our config on the root handlers.
+    root = logging.getLogger()
+    handler = next(
+        h for h in root.handlers
+        if isinstance(h, logging.StreamHandler)
+    )
+    assert "%(asctime)s" not in handler.formatter._fmt
+
+
+def test_minimal_style_only_message() -> None:
+    setup_logging(LoggingSettings(style="minimal"))
+    root = logging.getLogger()
+    handler = next(
+        h for h in root.handlers
+        if isinstance(h, logging.StreamHandler)
+    )
+    assert handler.formatter._fmt == "%(message)s"

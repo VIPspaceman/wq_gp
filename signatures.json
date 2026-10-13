@@ -52,6 +52,11 @@
     {"name": "ts_arg_max",     "input_types": ["MATRIX"], "output_type": "MATRIX",
      "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 20}}},
     {"name": "ts_arg_min",     "input_types": ["MATRIX"], "output_type": "MATRIX",
-     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 20}}}
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 20}}},
+
+    {"name": "group_rank",       "input_types": ["MATRIX", "GROUP"],           "output_type": "MATRIX"},
+    {"name": "group_mean",       "input_types": ["MATRIX", "MATRIX", "GROUP"], "output_type": "MATRIX"},
+    {"name": "group_zscore",     "input_types": ["MATRIX", "GROUP"],           "output_type": "MATRIX"},
+    {"name": "group_neutralize", "input_types": ["MATRIX", "GROUP"],           "output_type": "MATRIX"}
   ]
 }

@@ -1,0 +1,21 @@
+{
+  "logging": {
+    "level": "INFO",
+    "style": "default",
+    "components": {
+      "wqgp.brain.client": "DEBUG",
+      "wqgp.execution": "WARNING"
+    },
+    "file": null
+  },
+  "defaults": {
+    "region": "USA",
+    "universe": "TOP3000",
+    "delay": 1,
+    "n_workers": 4,
+    "max_concurrent": 2,
+    "seed": 42,
+    "max_generations": 10,
+    "checkpoint_root": "./checkpoints"
+  }
+}

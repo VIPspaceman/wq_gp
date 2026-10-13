@@ -34941,6 +34941,39 @@
       "output_type": "MATRIX"
     },
     {
+      "name": "group_mean",
+      "input_types": [
+        "MATRIX",
+        "MATRIX",
+        "GROUP"
+      ],
+      "output_type": "MATRIX"
+    },
+    {
+      "name": "group_neutralize",
+      "input_types": [
+        "MATRIX",
+        "GROUP"
+      ],
+      "output_type": "MATRIX"
+    },
+    {
+      "name": "group_rank",
+      "input_types": [
+        "MATRIX",
+        "GROUP"
+      ],
+      "output_type": "MATRIX"
+    },
+    {
+      "name": "group_zscore",
+      "input_types": [
+        "MATRIX",
+        "GROUP"
+      ],
+      "output_type": "MATRIX"
+    },
+    {
       "name": "hump",
       "input_types": [
         "MATRIX"
