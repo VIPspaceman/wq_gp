@@ -2437,3 +2437,73 @@ caller manages its lifetime explicitly. The current signature stays
 for the common one-shot case.
 
 ---
+
+---
+
+## D-105 — Diagnostics verify values, not just presence
+
+**Decision**: any diagnostic that reports whether an environment
+variable is correctly set must check its length or content, not only
+`${VAR:+...}`. The `${VAR:+<set>}` form proves only non-emptiness.
+
+**Why**: during Phase 4 Step 4 a user confirmed "password=[<set>]"
+and only discovered the variable held a single character after running
+`curl` and receiving a 401. The check reported presence; the user read
+it as correctness; two rounds were spent debugging the client before
+the real problem was visible.
+
+Canonical check for a password-like variable:
+
+    echo -n "$WQ_BRAIN_PASSWORD" | wc -c
+
+Show the length, never the value. A non-zero length that is obviously
+wrong (e.g. 1 for a real password) is the signal that the variable was
+mangled during assignment, typically by double-quoted shell expansion
+of `$`, `!`, or backticks.
+
+**Revisit if**: never. This is a debugging-hygiene rule.
+
+---
+
+---
+
+## D-106 — Repeated pages terminate pagination
+
+**Decision**: `PoolBuilder._fetch_paginated` computes a JSON signature
+of each page's items. If a page's signature equals the previous page's,
+the loop stops and the accumulated items (from the first page) are
+returned. No error is raised; this is a legitimate end-of-data signal
+for endpoints that ignore `limit`/`offset`.
+
+**Why**: BRAIN's `/operators` endpoint returns the full operator list
+on every request, regardless of the `limit` and `offset` query
+parameters. The `/data-fields` endpoint respects them. With the
+previous implementation (end only on a short page), `/operators` would
+return a full page forever, exhaust `max_pages`, and fail the whole
+build with a confusing "exceeded 200 pages" error. Users saw this as
+a bug in wqgp; it was actually the endpoint ignoring our pagination
+request.
+
+Detecting the repeat is the minimal fix. It preserves correct behavior
+on `/data-fields` (distinct pages keep advancing) and handles
+`/operators` without special-casing the endpoint name. It also covers
+future endpoints that might change their pagination behavior.
+
+The signature uses `json.dumps(items, sort_keys=True)`. Items are
+dicts with stable key ordering after `sort_keys`; identical responses
+serialize to identical strings. If an item contains a non-JSON-able
+value, the signature is `None` and the repeat check is skipped —
+degrading gracefully to the old behavior.
+
+The `max_pages` cap remains. If a hypothetical endpoint returned
+*full but distinct* pages forever, we would still stop at `max_pages`
+with an error. That case is not observed today, but keeping the cap
+costs nothing and prevents an unbounded loop.
+
+**Revisit if**: we observe an endpoint that legitimately returns two
+identical consecutive pages as part of a longer result. In that case
+the signature check needs to look at page index rather than content,
+or a new termination hint (e.g. a `Link: rel=next` header) needs to
+be used. Do NOT weaken the check to "only the first two pages".
+
+---

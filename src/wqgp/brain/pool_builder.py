@@ -8,6 +8,9 @@ Design decisions:
   no signature are dropped. See D-084.
 - Pagination via limit + offset, with a hard max_pages cap. See D-085.
 - The result is a frozen PoolBuildResult. See D-086.
+- If a page equals the previous page byte-for-byte, the server is
+  ignoring limit/offset; we treat the first page as the whole result.
+  See D-106.
 
 BRAIN does not return operator type signatures. The /operators endpoint
 gives names and descriptions only. Without signatures, an OperatorDef
@@ -62,7 +65,6 @@ class PoolBuilderProtocolError(PoolBuilderError):
 
 # --- type mapping (D-082) ---------------------------------------------------
 
-# BRAIN's type vocabulary. Anything not in this map is dropped.
 _BRAIN_TYPE_TO_DATATYPE: dict[str, DataType] = {
     "MATRIX": DataType.MATRIX,
     "VECTOR": DataType.VECTOR,
@@ -179,7 +181,7 @@ class OperatorSignatureTable:
         return cls.from_dict(data)
 
 
-# --- pagination helper (D-085) ----------------------------------------------
+# --- pagination helper (D-085, D-106) ---------------------------------------
 
 def _extract_items(payload: Any, endpoint: str) -> list[Any]:
     """BRAIN list endpoints return either a bare list or an object with
@@ -191,8 +193,6 @@ def _extract_items(payload: Any, endpoint: str) -> list[Any]:
             v = payload.get(key)
             if isinstance(v, list):
                 return v
-        # A dict without a recognized list key, but with a 'count' of 0,
-        # means an empty page. Treat as empty.
         if payload.get("count") == 0:
             return []
     raise PoolBuilderProtocolError(
@@ -276,11 +276,18 @@ class PoolBuilder:
     def _fetch_paginated(
         self, endpoint: str
     ) -> tuple[list[Any], int]:
-        """Fetch every page from `endpoint`. Returns (items, pages_fetched)."""
+        """Fetch every page from `endpoint`. Returns (items, pages_fetched).
+
+        Loop termination: a page shorter than page_limit marks the end.
+        Additionally, if a page equals the previous page byte-for-byte,
+        the server is ignoring limit/offset and we treat the first page
+        as the whole result. See D-106.
+        """
         self._ensure_authenticated()
         all_items: list[Any] = []
         offset = 0
         pages = 0
+        previous_signature: str | None = None
 
         for _ in range(self._max_pages):
             url = (
@@ -315,13 +322,32 @@ class PoolBuilder:
 
             items = _extract_items(payload, endpoint)
             pages += 1
+
+            # Detect a repeated page: the server ignored limit/offset
+            # and returned the same payload. The first page IS the whole
+            # result. See D-106.
+            signature: str | None
+            try:
+                signature = json.dumps(items, sort_keys=True)
+            except (TypeError, ValueError):
+                signature = None
+            if (
+                signature is not None
+                and previous_signature is not None
+                and signature == previous_signature
+            ):
+                return all_items, pages
+            previous_signature = signature
+
             all_items.extend(items)
             if len(items) < self._page_limit:
                 return all_items, pages
             offset += len(items)
 
         raise PoolBuilderError(
-            f"{endpoint}: exceeded {self._max_pages} pages"
+            f"{endpoint}: exceeded {self._max_pages} pages at offset "
+            f"{offset}. The server is returning distinct full pages "
+            f"that ignore limit/offset; check the endpoint's API."
         )
 
     # --- field parsing -------------------------------------------------
@@ -345,8 +371,6 @@ class PoolBuilder:
 
         dataset = _extract_dataset_id(raw.get("dataset"))
         if dataset is None:
-            # Without a dataset name, FieldDef cannot be constructed.
-            # Its __post_init__ rejects empty dataset.
             return None
 
         coverage = _coerce_coverage(raw.get("coverage"))
@@ -370,7 +394,9 @@ class PoolBuilder:
 
     # --- public --------------------------------------------------------
 
-    def fetch_fields(self) -> tuple[tuple[FieldDef, ...], tuple[str, ...], int]:
+    def fetch_fields(
+        self,
+    ) -> tuple[tuple[FieldDef, ...], tuple[str, ...], int]:
         """Fetch every field. Returns (fields, dropped_ids, pages)."""
         items, pages = self._fetch_paginated(_DATA_FIELDS_URL)
         kept: list[FieldDef] = []
@@ -378,11 +404,11 @@ class PoolBuilder:
         for raw in items:
             fd = self._parse_field(raw)
             if fd is None:
-                # Try to record the id for the report even when the
-                # field could not be built.
                 raw_id = raw.get("id") if isinstance(raw, dict) else None
                 dropped.append(
-                    raw_id if isinstance(raw_id, str) and raw_id else "<unknown>"
+                    raw_id
+                    if isinstance(raw_id, str) and raw_id
+                    else "<unknown>"
                 )
             else:
                 kept.append(fd)

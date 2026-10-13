@@ -247,6 +247,18 @@ def test_audit_bad_response_shape_raises() -> None:
     with pytest.raises(PoolBuilderProtocolError):
         audit_signatures(_creds(), t, _table(_add()))
 
+def test_audit_handles_operators_endpoint_ignoring_pagination() -> None:
+    """BRAIN's /operators may ignore limit/offset. The audit must still
+    return a result from the first page. See D-106."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    same = _ops_page("add", "sub", "ts_mean")   # 3 items >= page_limit
+    t.expect("GET", "/operators", same, same, same)
+
+    audit = audit_signatures(_creds(), t, _table(_add()))
+    assert audit.brain_operator_count == 3
+    assert set(audit.missing_from_table) == {"sub", "ts_mean"}
+
 
 # --- format_skeletons -------------------------------------------------------
 

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "operators": [
+    {
+      "name": "add",
+      "input_types": ["MATRIX", "MATRIX"],
+      "output_type": "MATRIX",
+      "commutative": true,
+      "associative": true,
+      "symmetric": true
+    }
+  ]
+}

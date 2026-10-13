@@ -459,15 +459,38 @@ def test_fetch_unexpected_shape_raises() -> None:
 
 
 def test_fetch_exceeds_max_pages() -> None:
+    """Every page is DISTINCT and full; max_pages caps the loop."""
     t = ScriptedTransport()
     t.expect("POST", "/authentication", _login_ok())
-    # Each page returns exactly page_limit items forever.
     t.expect(
         "GET", "/data-fields",
-        *[_page([_field(f"f{i}") for i in range(2)]) for _ in range(3)],
+        _page([_field("a0"), _field("a1")]),
+        _page([_field("b0"), _field("b1")]),
+        _page([_field("c0"), _field("c1")]),
     )
     with pytest.raises(PoolBuilderError):
         _builder(t, page_limit=2, max_pages=3).fetch_fields()
+
+
+def test_fetch_stops_when_server_ignores_pagination() -> None:
+    """If a page is byte-for-byte identical to the previous page, the
+    server is ignoring limit/offset; return the first page and stop.
+    See D-106."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    same_page = _page(
+        [_field(f"op{i}") for i in range(3)]  # full page (== page_limit)
+    )
+    t.expect("GET", "/data-fields", same_page, same_page, same_page)
+
+    fields, dropped, pages = _builder(
+        t, page_limit=3, max_pages=200
+    ).fetch_fields()
+
+    # We stopped after seeing the same page twice; fields are from page 1.
+    assert pages == 2
+    assert {f.field_id for f in fields} == {"op0", "op1", "op2"}
+    assert dropped == ()
 
 
 def test_fetch_transport_error_raises() -> None:
