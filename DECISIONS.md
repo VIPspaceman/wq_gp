@@ -1787,3 +1787,293 @@ BrainRateLimitError)` and write `except _RAISING_ERRORS: raise`. Do
 NOT start a chain of individual clauses.
 
 ---
+
+---
+
+## D-081 — PoolBuilder depends on HttpTransport
+
+**Decision**: `PoolBuilder` takes an `HttpTransport` in its
+constructor. Production passes `RequestsTransport`; tests pass
+`ScriptedTransport`. Same pattern as `BrainClient` (D-071).
+
+**Why**: consistency. A reader who knows how BrainClient is tested
+already knows how PoolBuilder is tested. And the same fake works for
+both, so `tests/_fakes.py` is the single source of truth for the
+transport double.
+
+**Revisit if**: BRAIN introduces an endpoint that needs different HTTP
+semantics (e.g. streaming). Then that endpoint gets its own transport
+abstraction rather than widening this one.
+
+---
+
+## D-082 — Unknown DataType strings are dropped, not guessed
+
+**Decision**: `PoolBuilder._parse_field` maps BRAIN's `type` string
+through a fixed table. A string not in the table causes the field to
+be dropped and recorded in `dropped_field_ids`.
+
+**Why**: BRAIN periodically adds new types (or renames existing ones).
+If we guessed — e.g. mapped anything unknown to MATRIX — a field that
+should have been GROUP would end up MATRIX, and every operator that
+expects a grouping key would fail at AST construction with a confusing
+error far from the root cause. Silently dropping is louder: the report
+tells you which fields vanished, and you can extend the table.
+
+Dropping also gives a clean upgrade path: add the new type to the map,
+re-run the builder, done.
+
+**Revisit if**: the dropped count becomes routinely large (>5% of
+fields). Then BRAIN has likely added a family of types (e.g. all
+"TIME_*"), and the fix is to extend the table, not to loosen the rule.
+
+---
+
+## D-083 — SemanticKind inference is GROUP → CATEGORICAL, else NUMERIC
+
+**Decision**: `_semantic_kind_for(data_type)` returns CATEGORICAL for
+GROUP and NUMERIC for everything else. It never returns TIME.
+
+**Why**: BRAIN's `type` field is the only reliable classifier we get.
+A GROUP field is by definition a grouping key, and grouping keys are
+categorical. Everything else is used numerically in practice. There is
+no reliable signal for TIME in the field payload, and a wrong TIME
+label would be worse than no label — the fingerprint's scalar
+normalization (D-012) and any future time-aware operator would
+misbehave.
+
+Doing nothing is the right default for the other cases.
+
+**Revisit if**: BRAIN exposes a `semantic` or `role` field, or if we
+find a class of fields that are numerically typed but time-like
+(e.g. a "last update timestamp" field). Then extend this function
+with an explicit rule per case and a test for each.
+
+---
+
+## D-084 — Operator signatures come from an external table
+
+**Decision**: `PoolBuilder.build(signatures)` takes an
+`OperatorSignatureTable`. Operators named by BRAIN but missing from the
+table are dropped and reported in `dropped_operator_names`.
+
+**Why**: BRAIN's `/operators` endpoint returns names and descriptions
+only. It does not return `input_types`, `output_type`, `param_domains`,
+or the commutativity flags. Those are exactly what the AST layer needs
+(D-007, D-008, D-009). Constructing a bare `OperatorDef` with a guessed
+signature would poison the type checker: every "add(a, b)" would type
+check against the wrong arity, and the failures would surface three
+layers down.
+
+Requiring an external table makes the missing knowledge explicit and
+localized. The table is version-controlled, reviewable, and can be
+extended by one person without touching any code.
+
+**Revisit if**: BRAIN adds a `/operator-signatures` endpoint, or
+publishes a machine-readable schema. Then `PoolBuilder` gains a second
+fetch and the table becomes optional. Do NOT make the table optional
+before that — the current requirement is the thing that keeps the
+type system honest.
+
+---
+
+## D-085 — Pagination is limit + offset, with a hard page cap
+
+**Decision**: `_fetch_paginated` issues `?limit=N&offset=M` requests
+in a loop. It stops when a page returns fewer than `limit` items.
+`max_pages` caps the loop; exceeding it raises `PoolBuilderError`.
+
+**Why**: BRAIN's list endpoints return either a bare list or an object
+with a `results` / `data` / `items` field. A "short page" is the
+universal end-of-data signal, and it works for both shapes without
+needing a `total` field. The `max_pages` cap prevents an infinite loop
+if the server ever returns full pages forever — a real failure mode
+for a buggy endpoint, and one that would silently consume memory.
+
+`_extract_items` accepts all three list-field names because we do not
+control which one BRAIN returns, and refusing to parse a valid response
+because of a key name is not a useful failure.
+
+**Revisit if**: BRAIN returns a `next` URL or a cursor instead of an
+offset. Then `_fetch_paginated` needs a second mode. Do NOT try to
+support both transparently; make the caller choose, so the failure
+mode is visible.
+
+---
+
+## D-086 — PoolBuildResult is a frozen value object
+
+**Decision**: `build()` returns a frozen `PoolBuildResult` carrying the
+`Pool` plus four counters and two tuples of dropped ids/names.
+
+**Why**: the caller needs to know what was dropped. A builder that
+returns just a `Pool` forces the caller to diff against the raw
+response — impossible, because the caller does not have the raw
+response. Making the drops a first-class part of the result keeps the
+information visible at the call site.
+
+Frozen because the result must not be mutated after construction; a
+caller who wants a modified pool should build a new one.
+
+The `summary()` method is a convenience for logging. It is not the
+canonical API; callers who need the raw tuples use the fields.
+
+**Revisit if**: we add a "strict mode" that raises on any drop. Then
+`PoolBuildResult` gains a flag or a separate `StrictPoolBuildResult`.
+Do NOT change the default behavior — dropping is the correct default
+for exploratory runs, where the search space naturally drifts.
+
+---
+
+---
+
+## D-087 — CLI uses argparse subcommands, not typer/click
+
+**Decision**: the CLI is built with `argparse` and one subparser per
+command. No third-party CLI library.
+
+**Why**: zero runtime dependency. The project already depends on
+`requests` for the BRAIN client; every extra dependency is a supply-
+chain surface and a version conflict waiting to happen. `argparse`
+covers everything we need: subcommands, typed flags, help text,
+`--version`, usage-error exit codes.
+
+The subcommand list is stable (`build-pool`, `run`, `list-runs`) and
+small. If the list grows to fifteen commands with nested groups, a
+library like `click` would earn its keep. It has not, and I do not
+expect it to.
+
+**Revisit if**: the help text starts repeating itself, or we need
+shell completion. Both are `click` territory. Migrating later is a
+mechanical refactor because the command bodies are plain functions
+taking an `argparse.Namespace`.
+
+---
+
+## D-088 — Config is JSON; flag > config > default
+
+**Decision**: `--config PATH` loads a JSON file. Every flag has a
+matching config key; if the flag is set it wins, otherwise the config
+value, otherwise the built-in default. Merge logic lives in `_pick`.
+
+**Why**: two audiences. An interactive user types flags; a scheduled
+job writes a config file once and reuses it. Supporting both with the
+same precedence rule means the interactive user can "override one
+thing" against a config file without rewriting it.
+
+JSON over TOML because `tomllib` is Python 3.11+, and the project
+targets 3.10. Adding `tomli` would be a second dependency for a
+cosmetic format preference.
+
+The precedence rule is stated in one helper (`_pick`) rather than
+inlined in every resolver. One rule, one place to change.
+
+**Revisit if**: config files become nested enough that JSON becomes
+painful (comments, trailing commas). At that point, add `tomli` for
+3.10 and keep the same precedence helper. Do NOT introduce a
+"config inherits from config" chain; that is a different feature.
+
+---
+
+## D-089 — Secrets only from environment variables
+
+**Decision**: `WQ_BRAIN_USERNAME` and `WQ_BRAIN_PASSWORD` are read by
+`BrainCredentials.from_env()`. Neither the config file nor any CLI
+flag accepts a credential.
+
+**Why**: a credential in a config file ends up in git; a credential on
+a command line ends up in shell history and in `ps` output. Neither is
+acceptable. Environment variables are visible only to the process
+owner and to root, and are the standard for secret injection in
+containers and CI.
+
+The decision is enforced at three layers: the CLI never defines a
+credential flag, `RunConfig` has no credential field, and
+`BrainCredentials` is constructed only inside `build_default_client()`
+and `_cmd_build_pool`. There is no "just this once" path.
+
+**Revisit if**: a hosted deployment needs credential injection from a
+vault at runtime. Then a `--credentials-command` flag that *executes*
+a command returning JSON would be the pattern — still not accepting
+the secret on the CLI, but allowing retrieval. That is a distinct
+feature with its own decision.
+
+---
+
+## D-090 — SIGINT propagates; exit code 130
+
+**Decision**: `main()` catches `KeyboardInterrupt`, logs "interrupted
+by user", and returns 130. It does NOT install a signal handler. Any
+in-progress `Coordinator.run()` finishes its `finally` block before
+the exception reaches `main`.
+
+**Why**: 130 is the conventional shell exit code for SIGINT (128 + 2).
+Scripts that key off this code behave correctly.
+
+Installing a custom signal handler would be worse: it would either
+have to reach into the Coordinator to set a "stop soon" flag (adding
+coupling), or it would raise the exception anyway (same as now, with
+extra code). Python's default is already correct.
+
+Known limitation: worker threads do not receive signals, so a
+`Coordinator.run()` interrupted mid-poll may block in `shutdown()`
+until the in-flight poll completes. That is a coordinator-level
+concern (see future work), not a CLI concern. The user sees the
+`KeyboardInterrupt` logged and the process waits a bounded amount
+of time for cleanup.
+
+**Revisit if**: we want "interrupt stops after the current generation,
+saving a checkpoint" as a first-class feature. Then `Coordinator`
+gains a `stop_requested` callable and the CLI installs a handler
+that flips a boolean. That change touches Coordinator, not just CLI,
+and gets its own decision.
+
+---
+
+## D-091 — Logging to stderr, level via --log-level
+
+**Decision**: `logging.basicConfig` writes to stderr with a
+timestamped format. `--log-level` sets the level (default INFO).
+The `list-runs` command prints its table to stdout, not through the
+logger.
+
+**Why**: logs and command output are different channels. Logs go to
+stderr, machine-readable output goes to stdout, so a shell pipeline
+can consume one without the other. `list-runs` is a query command;
+its output is the point, not a side effect.
+
+The format includes logger name and level so a multi-module trace is
+readable without extra configuration. Timestamps are local; a
+production deployment that needs UTC can set `TZ=UTC` in the
+environment.
+
+**Revisit if**: we add `--json-logs` for machine consumption. That is
+a second formatter selected by a flag, not a change to the default.
+
+---
+
+## D-092 — --dry-run uses a deterministic hash-based evaluator
+
+**Decision**: `--dry-run` replaces the real `BrainClient` with
+`_dry_run_evaluator`, a function that computes
+`SHA-256(fingerprint)[:8]` as a 64-bit integer and scales it to
+`[0, 3.0)` as a fitness.
+
+**Why**: end-to-end CLI tests need to exercise the full pipeline
+(build-pool, config loading, coordinator, checkpoints) without
+network and without credentials. A random evaluator would break the
+reproducibility contract that D-016, D-041, and D-067 rely on;
+hashing the fingerprint gives a stable fitness per expression across
+processes and runs.
+
+SHA-256 specifically (not Python's `hash()`) because `hash()` for
+strings is randomized per-process unless `PYTHONHASHSEED` is set.
+A test that passed one process and failed the next is exactly the
+kind of flake we want to never introduce.
+
+**Revisit if**: dry runs need to mimic BRAIN's failure modes (e.g. a
+percentage of expressions rejected). Then `_dry_run_evaluator` gains
+a failure probability driven by the same hash. Keep it deterministic;
+do not introduce randomness.
+
+---

@@ -6,20 +6,85 @@ WorldQuant BRAIN alpha mining via genetic programming.
 
 Phase 1 (foundation) — COMPLETE.
 Phase 2 (skeleton)   — COMPLETE.
+Phase 3 (GP core)    — COMPLETE.
 
-Phase 3 (GP core) — IN PROGRESS.
+Phase 4 (polish) — IN PROGRESS.
 
-- [x] `population.py`       — Individual, Population, RandomAstBuilder
-- [x] `mutation.py`         — window / field / operator / subtree mutations
-- [x] `crossover.py`        — subtree crossover with type and size guards
-- [x] `selection.py`        — tournament, elitism, next_generation
-- [x] `gp_serialization.py` — AST / Individual / Population round-trip
-- [x] `coordinator.py`      — end-to-end GP loop with checkpoints
-- [x] `brain/transport.py`  — HttpTransport protocol + requests backend
-- [x] `brain/client.py`     — BrainClient (real Evaluator against BRAIN)
-- [ ] `pareto.py`           — multi-objective (deferred)
+- [x] `brain/pool_builder.py`    — fetch fields + operator names from BRAIN
+- [x] `cli.py`                   — command-line entry point
+- [ ] `notification/telegram.py` — Telegram notifications
+- [ ] `pareto.py`                — multi-objective selection
+- [ ] `tools/`                   — analysis scripts
 
 See `DECISIONS.md` for every deviation from the reference project.
+
+## Install
+
+    pip install -e ".[dev]"
+
+## Usage
+
+Secrets are read only from the environment:
+
+    export WQ_BRAIN_USERNAME=...
+    export WQ_BRAIN_PASSWORD=...
+
+### 1. Build the pool
+
+    wqgp build-pool \
+        --signatures signatures.json \
+        --output pool.json
+
+The signature table is a JSON file with the type signatures for the
+operators you want to use. BRAIN's `/operators` endpoint returns names
+only; this table supplies the rest. The builder drops operators not
+present in the table and reports them.
+
+### 2. Run the GP
+
+    wqgp run \
+        --pool pool.json \
+        --run-id my_first_run \
+        --total-simulations 1000 \
+        --population-size 20 \
+        --max-generations 10 \
+        --seed 42 \
+        --checkpoint-root ./checkpoints
+
+Re-running with the same `--run-id` resumes from the last checkpoint.
+
+### 3. Smoke-test without network
+
+    wqgp run \
+        --pool pool.json \
+        --run-id smoke \
+        --total-simulations 100 \
+        --max-generations 2 \
+        --dry-run
+
+`--dry-run` uses a deterministic fake evaluator. No credentials needed.
+
+### 4. Inspect runs
+
+    wqgp list-runs --checkpoint-root ./checkpoints
+
+### Config file
+
+Any `run` flag can also be set in a JSON config passed via `--config`.
+Flags override config values.
+
+    {
+      "run_id": "my_run",
+      "pool_path": "./pool.json",
+      "checkpoint_root": "./checkpoints",
+      "seed": 42,
+      "max_generations": 10,
+      "n_workers": 4,
+      "budget": { "total_simulations": 1000 },
+      "selection": { "population_size": 20, "elite_count": 2 }
+    }
+
+Credentials are NOT accepted in the config file.
 
 ## Layout
 
@@ -40,36 +105,17 @@ See `DECISIONS.md` for every deviation from the reference project.
     src/wqgp/selection.py         # SelectionConfig, tournament, elitism
     src/wqgp/gp_serialization.py  # AST / Individual / Population JSON
     src/wqgp/coordinator.py       # RunConfig, Coordinator, RunResult
+    src/wqgp/cli.py               # command-line entry point
+    src/wqgp/__main__.py          # python -m wqgp
     src/wqgp/brain/
       __init__.py
       transport.py                # HttpTransport, HttpResponse, RequestsTransport
       client.py                   # BrainCredentials, BrainSettings, BrainClient
-    tests/                        # Phase 1 + Phase 2 + Phase 3 gates
-
-## Usage
-
-    export WQ_BRAIN_USERNAME=...
-    export WQ_BRAIN_PASSWORD=...
-
-    from wqgp.brain.client import build_default_client
-    from wqgp.coordinator import Coordinator, RunConfig
-    from wqgp.pool import Pool
-    from wqgp.budget import Budget
-    from wqgp.selection import SelectionConfig
-
-    client = build_default_client()
-    config = RunConfig(
-        run_id="my_first_run",
-        pool=Pool.from_file("pool.json"),
-        budget=Budget(total_simulations=1000),
-        selection=SelectionConfig(population_size=20),
-        seed=42,
-        max_generations=10,
-    )
-    result = Coordinator(config, client).run()
-    print(result.stopped_reason, result.total_simulations_used)
+      pool_builder.py             # PoolBuilder, OperatorSignatureTable
+    tests/
+      _fakes.py                   # ScriptedTransport (shared test double)
+      ...
 
 ## Run tests
 
-    pip install -e ".[dev]"
     pytest
