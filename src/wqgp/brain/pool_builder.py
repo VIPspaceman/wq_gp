@@ -274,7 +274,7 @@ class PoolBuilder:
         transport: HttpTransport,
         settings: BrainSettings | None = None,
         *,
-        page_limit: int = 500,
+        page_limit: int = 50,
         max_pages: int = 200,
         http_timeout: float = 30.0,
         sleep_fn: Callable[[float], None] = time.sleep,

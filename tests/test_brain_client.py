@@ -1,6 +1,10 @@
-"""Tests for the BRAIN client. Phase 3 Step 6 gate.
+"""Tests for the BRAIN client. Phase 3 Step 6 gate + D-110 .. D-113.
 
 Every test uses a ScriptedTransport; no real network calls.
+
+The _sim_complete / _alpha_details pair reflects BRAIN's real
+two-step shape: a COMPLETE poll response carries an alpha id, and
+the metrics come from a second GET /alphas/{id}.
 """
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ from wqgp.brain.client import (
     BrainAuthError,
     BrainClient,
     BrainClientError,
+    BrainConcurrencyLimitError,
     BrainCredentials,
     BrainProtocolError,
     BrainSettings,
@@ -46,14 +51,32 @@ def _submit_ok(sim_url: str = "/simulations/123") -> HttpResponse:
     return make_response(201, headers={"Location": sim_url})
 
 
-def _sim_done(sharpe: float = 1.5, **extra: Any) -> HttpResponse:
+def _sim_in_progress(progress: float = 0.5) -> HttpResponse:
+    """BRAIN's in-progress shape: just a progress float, no status."""
+    return make_response(200, json_body={"progress": progress})
+
+
+def _sim_complete(alpha_id: str = "alpha_1") -> HttpResponse:
+    """BRAIN's COMPLETE poll shape: status + alpha id, NO metrics."""
+    return make_response(
+        200,
+        json_body={
+            "id": "sim_id",
+            "status": "COMPLETE",
+            "alpha": alpha_id,
+            "regular": "ts_mean(close, 5)",
+        },
+    )
+
+
+def _alpha_details(sharpe: float = 1.5, **extra: Any) -> HttpResponse:
+    """Shape of GET /alphas/{id}: carries the 'is' metrics block."""
     metrics = {"sharpe": sharpe, "turnover": 0.3, "returns": 0.05}
     metrics.update(extra)
     return make_response(
         200,
         json_body={
             "id": "alpha_1",
-            "status": "COMPLETE",
             "is": metrics,
         },
     )
@@ -64,6 +87,7 @@ def _client(
     *,
     max_polls: int = 5,
     sleep_fn=None,
+    max_concurrent: int = 2,
 ) -> BrainClient:
     return BrainClient(
         credentials=_creds(),
@@ -73,6 +97,7 @@ def _client(
         max_polls=max_polls,
         poll_timeout_seconds=100.0,
         base_poll_interval=0.001,
+        max_concurrent=max_concurrent,
     )
 
 
@@ -143,6 +168,14 @@ def test_settings_to_api_dict_keys() -> None:
         assert k in d
 
 
+def test_settings_defaults_match_brain_accepted_values() -> None:
+    """D-113: defaults aligned with values BRAIN accepted for a
+    TUTORIAL account in the reference project."""
+    s = BrainSettings()
+    assert s.decay == 4
+    assert s.neutralization == "INDUSTRY"
+
+
 # --- default_fitness --------------------------------------------------------
 
 def test_default_fitness_returns_sharpe() -> None:
@@ -159,7 +192,8 @@ def test_call_submits_and_returns_success() -> None:
     t = ScriptedTransport()
     t.expect("POST", "/authentication", _login_ok())
     t.expect("POST", "/simulations", _submit_ok())
-    t.expect("GET", "/simulations/123", _sim_done(sharpe=2.0))
+    t.expect("GET", "/simulations/123", _sim_complete())
+    t.expect("GET", "/alphas/alpha_1", _alpha_details(sharpe=2.0))
 
     result = _client(t)(_task())
 
@@ -174,8 +208,10 @@ def test_call_reuses_authentication() -> None:
     t.expect("POST", "/simulations",
              _submit_ok("/simulations/1"),
              _submit_ok("/simulations/2"))
-    t.expect("GET", "/simulations/1", _sim_done(1.0))
-    t.expect("GET", "/simulations/2", _sim_done(2.0))
+    t.expect("GET", "/simulations/1", _sim_complete("alpha_1"))
+    t.expect("GET", "/simulations/2", _sim_complete("alpha_2"))
+    t.expect("GET", "/alphas/alpha_1", _alpha_details(1.0))
+    t.expect("GET", "/alphas/alpha_2", _alpha_details(2.0))
 
     c = _client(t)
     c(_task("a"))
@@ -189,7 +225,8 @@ def test_call_sends_correct_body() -> None:
     t = ScriptedTransport()
     t.expect("POST", "/authentication", _login_ok())
     t.expect("POST", "/simulations", _submit_ok())
-    t.expect("GET", "/simulations/123", _sim_done())
+    t.expect("GET", "/simulations/123", _sim_complete())
+    t.expect("GET", "/alphas/alpha_1", _alpha_details())
 
     _client(t)(_task("ts_mean(close, 5)"))
 
@@ -198,7 +235,24 @@ def test_call_sends_correct_body() -> None:
     body = submit[0][2]["json_body"]
     assert body["type"] == "REGULAR"
     assert body["regular"] == "ts_mean(close, 5)"
-    assert "settings" in body
+    assert body["settings"]["decay"] == 4
+    assert body["settings"]["neutralization"] == "INDUSTRY"
+
+
+def test_call_fetches_alpha_details_after_complete() -> None:
+    """D-110: metrics are NOT in the poll body; a second GET is made."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect("POST", "/simulations", _submit_ok())
+    t.expect("GET", "/simulations/123", _sim_complete("alpha_xyz"))
+    t.expect("GET", "/alphas/alpha_xyz", _alpha_details(sharpe=7.5))
+
+    result = _client(t)(_task())
+    assert result.fitness == 7.5
+
+    alpha_urls = [url for _, url, _ in t.calls if "/alphas/" in url]
+    assert len(alpha_urls) == 1
+    assert alpha_urls[0].endswith("/alphas/alpha_xyz")
 
 
 # --- polling ---------------------------------------------------------------
@@ -211,12 +265,31 @@ def test_call_waits_when_poll_returns_202() -> None:
         "GET", "/simulations/123",
         make_response(202, headers={"Retry-After": "0.001"}),
         make_response(202, headers={"Retry-After": "0.001"}),
-        _sim_done(3.0),
+        _sim_complete(),
     )
+    t.expect("GET", "/alphas/alpha_1", _alpha_details(3.0))
 
     result = _client(t)(_task())
     assert result.status is TaskStatus.SUCCESS
     assert result.fitness == 3.0
+
+
+def test_call_waits_when_poll_returns_progress_only() -> None:
+    """D-110: BRAIN returns HTTP 200 + {'progress': x} while running."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect("POST", "/simulations", _submit_ok())
+    t.expect(
+        "GET", "/simulations/123",
+        _sim_in_progress(0.1),
+        _sim_in_progress(0.5),
+        _sim_complete(),
+    )
+    t.expect("GET", "/alphas/alpha_1", _alpha_details(2.5))
+
+    result = _client(t)(_task())
+    assert result.status is TaskStatus.SUCCESS
+    assert result.fitness == 2.5
 
 
 def test_call_honors_retry_after() -> None:
@@ -227,8 +300,9 @@ def test_call_honors_retry_after() -> None:
     t.expect(
         "GET", "/simulations/123",
         make_response(202, headers={"Retry-After": "0.5"}),
-        _sim_done(),
+        _sim_complete(),
     )
+    t.expect("GET", "/alphas/alpha_1", _alpha_details())
 
     c = BrainClient(
         credentials=_creds(),
@@ -266,8 +340,10 @@ def test_call_retries_transient_transport_error() -> None:
     t.expect(
         "GET", "/simulations/123",
         TransportError("connection reset"),
-        _sim_done(4.0),
+        _sim_complete(),
     )
+    t.expect("GET", "/alphas/alpha_1", _alpha_details(4.0))
+
     result = _client(t)(_task())
     assert result.status is TaskStatus.SUCCESS
     assert result.fitness == 4.0
@@ -280,8 +356,10 @@ def test_call_retries_5xx() -> None:
     t.expect(
         "GET", "/simulations/123",
         make_response(503, body=b"service unavailable"),
-        _sim_done(5.0),
+        _sim_complete(),
     )
+    t.expect("GET", "/alphas/alpha_1", _alpha_details(5.0))
+
     result = _client(t)(_task())
     assert result.status is TaskStatus.SUCCESS
     assert result.fitness == 5.0
@@ -305,6 +383,27 @@ def test_call_handles_error_status_in_body() -> None:
     assert "bad expression" in (result.error or "")
 
 
+def test_call_handles_warning_with_message_as_terminal() -> None:
+    """D-111: WARNING + message is a terminal failure, not 'still running'."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect("POST", "/simulations", _submit_ok())
+    t.expect(
+        "GET", "/simulations/123",
+        make_response(
+            200,
+            json_body={
+                "status": "WARNING",
+                "message": "Incompatible unit for input of sqrt",
+                "alpha": "A1",
+            },
+        ),
+    )
+    result = _client(t)(_task())
+    assert result.status is TaskStatus.FAILED
+    assert "Incompatible unit" in (result.error or "")
+
+
 def test_call_handles_submit_4xx_as_failure() -> None:
     t = ScriptedTransport()
     t.expect("POST", "/authentication", _login_ok())
@@ -326,7 +425,7 @@ def test_call_handles_missing_location_header() -> None:
     assert "Location" in (result.error or "")
 
 
-def test_call_handles_missing_is_block() -> None:
+def test_call_handles_complete_without_alpha_id() -> None:
     t = ScriptedTransport()
     t.expect("POST", "/authentication", _login_ok())
     t.expect("POST", "/simulations", _submit_ok())
@@ -338,17 +437,76 @@ def test_call_handles_missing_is_block() -> None:
     assert result.status is TaskStatus.FAILED
 
 
+def test_call_handles_alpha_details_missing_is_block() -> None:
+    """The second GET /alphas/{id} must carry the 'is' block."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect("POST", "/simulations", _submit_ok())
+    t.expect("GET", "/simulations/123", _sim_complete())
+    t.expect(
+        "GET", "/alphas/alpha_1",
+        make_response(200, json_body={"id": "alpha_1"}),  # no 'is'
+    )
+    result = _client(t)(_task())
+    assert result.status is TaskStatus.FAILED
+
+
 def test_call_fails_when_fitness_fn_returns_none() -> None:
     t = ScriptedTransport()
     t.expect("POST", "/authentication", _login_ok())
     t.expect("POST", "/simulations", _submit_ok())
+    t.expect("GET", "/simulations/123", _sim_complete())
     t.expect(
-        "GET", "/simulations/123",
+        "GET", "/alphas/alpha_1",
         make_response(200, json_body={"id": "a", "is": {"turnover": 0.3}}),
     )
     result = _client(t)(_task())
     assert result.status is TaskStatus.FAILED
     assert "fitness" in (result.error or "").lower()
+
+
+# --- concurrency (D-112) ----------------------------------------------------
+
+def test_submit_429_concurrency_limit_is_specific_error() -> None:
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect(
+        "POST", "/simulations",
+        make_response(
+            429,
+            json_body={
+                "detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"
+            },
+        ),
+    )
+    result = _client(t)(_task())
+    assert result.status is TaskStatus.FAILED
+    assert "concurrent simulation limit" in (result.error or "").lower()
+
+
+def test_submit_429_generic_rate_limit_is_not_concurrency_error() -> None:
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect(
+        "POST", "/simulations",
+        make_response(
+            429,
+            json_body={"detail": "Request was throttled"},
+        ),
+    )
+    result = _client(t)(_task())
+    assert result.status is TaskStatus.FAILED
+    assert "rate limited" in (result.error or "").lower()
+
+
+def test_client_rejects_zero_max_concurrent() -> None:
+    with pytest.raises(ValueError):
+        BrainClient(
+            credentials=_creds(),
+            settings=_settings(),
+            transport=ScriptedTransport(),
+            max_concurrent=0,
+        )
 
 
 # --- auth ------------------------------------------------------------------

@@ -2600,3 +2600,217 @@ retry — a hard 429 that kills a multi-minute fetch is worse than a
 few seconds of sleeping.
 
 ---
+
+---
+
+## D-109 — BRAIN /data-fields rejects large page sizes with 400
+
+**Decision**: `PoolBuilder`'s default `page_limit` is 50. D-108's
+attempt to raise it to 500 was reverted after BRAIN returned HTTP 400
+at offset 0 on the first request with `limit=500`.
+
+**Why**: the reasoning behind D-108 was that fewer requests would
+avoid hitting the rate limit. That is true in principle but does not
+work in practice: BRAIN imposes a maximum page size below 500 and
+rejects larger values with a bare `400 Bad Request` (no `detail`
+message telling us the cap). Probing for the exact maximum would burn
+request quota on a value that changes without notice.
+
+50 is known to work — every successful fetch in this project has used
+it, including the earlier partial run that reached offset 200 before
+hitting the rate limit. Combined with D-108's retry-on-429 logic, the
+default handles both failure modes:
+
+  - Too many requests per minute → 429, retried after Retry-After.
+  - Too-large page → not sent; we stay at a page size BRAIN accepts.
+
+The retry logic from D-108 remains in place and is exercised by tests
+independently of the default page size.
+
+**Revisit if**: BRAIN publishes a maximum page size in its docs, or if
+we discover empirically that a larger value (e.g. 100, 200) is also
+accepted. Even then, the retry logic must stay: any page size can
+still hit the per-minute quota during a long fetch.
+
+---
+
+---
+
+## D-110 — Poll responses are two-step; metrics need a second GET
+
+**Decision**: the poll loop interprets four response shapes, only one
+of which yields metrics — and even that one requires a second request.
+
+- `{"progress": float}` (no status) → keep polling.
+- `{"status": "COMPLETE", "alpha": "<id>"}` → GET
+  `/alphas/<id>`, extract the `is` block, done.
+- `{"status": "ERROR", ...}` → terminal failure.
+- `{"status": "WARNING", "message": ...}` → terminal failure (D-111).
+
+The polling response NEVER contains the `is` metrics block. Metrics
+live only on the alpha resource.
+
+**Why**: the previous implementation expected `is` in the poll body.
+That expectation was wrong and produced `poll response missing 'is'
+block` on every successful simulation. A direct probe of BRAIN (a
+`close` alpha) confirmed the real shapes:
+
+    POLL 1-7:  HTTP 200  {"progress": 0.1} ... {"progress": 0.35}
+    POLL 8:    HTTP 200  {"id": "...", "status": "COMPLETE",
+                          "alpha": "9qEqww9V", "regular": "close", ...}
+
+No `is`. No `sharpe`. Just an alpha id.
+
+The two-step flow mirrors how the reference project's
+`SimulationPoller.wait_for_simulation` works: on COMPLETE it does
+`GET /alphas/{alpha_id}` to obtain the metrics. The extra request per
+simulation is negligible compared to the minutes the simulation
+itself takes.
+
+The alternative — asking BRAIN for a "return metrics inline" mode —
+does not exist. The platform's contract is fixed.
+
+**Revisit if**: BRAIN adds an `is` block to the simulation poll
+response (e.g. for REGULAR-type simulations). Then the second GET can
+be skipped when `is` is present. Add the branch; do not remove the
+`/alphas/{id}` fetch, because it will still be needed for other
+simulation types.
+
+---
+
+## D-111 — WARNING with a message is terminal
+
+**Decision**: when the poll body has `status == "WARNING"` and a
+non-empty `message`, the client returns a FAILED `SimulationResult`
+immediately. It does not sleep, retry, or keep polling. Only a
+WARNING with no message is treated as "keep waiting".
+
+**Why**: the reference project documented this exact hazard:
+
+> BRAIN's WARNING with a message is a **terminal** state (computation
+> finished but with an error), not "in progress". Previously, a
+> warning was treated as ongoing, causing WARNING → wait 60s →
+> timeout → retry → WARNING → ... Each incompatible-unit alpha
+> wasted three simulations.
+
+A simulation that has emitted a WARNING with a message will not
+later emit COMPLETE. Treating it as ongoing wastes wall-clock time
+and, worse, simulation budget on retries that cannot succeed. The
+correct response is to record the failure and move on.
+
+The "WARNING with no message" branch is kept as a continuing state
+because we have not observed a message-less WARNING in practice, and
+the reference project's own heuristic (wait up to
+`min(warning_timeout, 3 * poll_interval)`) suggests the state can be
+transient in rare cases. When in doubt, waiting is safer than
+failing — but only when the server has not told us the reason.
+
+**Revisit if**: BRAIN starts emitting non-terminal WARNINGs with
+messages. Then this rule needs a discriminator (e.g. a specific
+message prefix). Do NOT relax it on the assumption that a message
+might be informational.
+
+---
+
+## D-112 — A semaphore bounds simultaneously active simulations
+
+**Decision**: `BrainClient` takes a `max_concurrent` parameter
+(default 2) and holds a `BoundedSemaphore` with that many permits.
+`__call__` acquires a permit before the submit and releases it after
+the poll loop returns, so a permit is held for the whole
+submit+poll cycle, not just the POST.
+
+**Why**: BRAIN enforces a per-account concurrency cap. Exceeding it
+returns HTTP 429 with `{"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}`.
+This is a distinct failure mode from the per-minute request-rate
+limit; it depends on how many simulations the account is currently
+running, not how many requests have been issued.
+
+The observed behavior during Phase 4 with a TUTORIAL account:
+submitting 8 tasks with `n_workers=4` produced 5 concurrency 429s
+out of 8. The cap for this account tier is around 2-3.
+
+Holding the permit across the poll loop is the correct semantics: a
+simulation occupies a BRAIN-side slot for its entire runtime
+(minutes), not just for the submit POST (milliseconds). If we
+released after submit, the semaphore would not bound anything
+useful.
+
+Default 2 matches the low end of the observed cap. Users with a
+higher account tier can raise it; users on TUTORIAL should not need
+to. The parameter is exposed on `build_default_client` so the CLI
+can add a flag later if requested.
+
+`BoundedSemaphore` (not `Semaphore`) so an accidental double-release
+raises immediately rather than silently inflating the permit count.
+
+**Revisit if**: BRAIN starts advertising the concurrency cap in a
+response header (e.g. `x-concurrency-limit`). Then the client can
+read it at login and set `max_concurrent` automatically. Do NOT
+hard-code a number above the documented minimum.
+
+---
+
+## D-113 — BrainSettings defaults match BRAIN-accepted values
+
+**Decision**: `BrainSettings` now defaults to `decay=4` and
+`neutralization="INDUSTRY"`. Previously it was `decay=0` and
+`neutralization="SUBINDUSTRY"`.
+
+**Why**: the earlier defaults were plausible guesses that were never
+verified. The reference project's `config/settings.py` uses
+`decay=4` and `neutralization="INDUSTRY"`, and the Phase 4 probe
+submitted a simulation with exactly these values and received a
+clean `COMPLETE` from BRAIN. A second data point (this project's own
+successful probe) confirms they are accepted.
+
+`decay=0` and `SUBINDUSTRY` may also be legal, but we have no
+positive evidence for either. Changing the defaults to a known-good
+pair removes one source of "why did every simulation fail"
+ambiguity without costing anything in expressiveness: the user can
+still override every field.
+
+The test `test_settings_defaults_match_brain_accepted_values` pins
+both fields. If a future update changes them, the test fails with a
+clear message pointing at this decision.
+
+**Revisit if**: BRAIN documents that these values are account-tier
+dependent. Then the defaults stay at the most permissive pair the
+lowest tier accepts; the TUTORIAL tier currently accepts
+`INDUSTRY` and `decay=4`.
+
+---
+
+---
+
+## D-114 — HTTP 202 is accepted without body parsing
+
+**Decision**: `_poll` treats HTTP 202 as "accepted, not done": it
+sleeps per the Retry-After header and continues the loop, without
+attempting to parse the response body. Only HTTP 200 goes through
+`resp.json()`.
+
+**Why**: an earlier edit collapsed the `not in (200, 202)` branch
+into a `!= 200` check, which sent 202 responses into the JSON parse
+path. Since 202 responses from our test transport carry no body,
+`json.loads("")` raised and every simulated 202 became a
+`BrainProtocolError`. Three tests failed on this (`waits_when_poll_
+returns_202`, `honors_retry_after`, `exceeds_max_polls`).
+
+The fix is a two-branch structure: 202 handled first (sleep +
+continue), then everything-other-than-200 handled as error/retry.
+The 202 case is structurally different from a 200: it means the
+server has not yet finished and has no data to send. A body-parsing
+step before that branch is a mistake regardless of whether the body
+happens to be JSON.
+
+BRAIN's own contract, as observed by the probe, never returns 202 —
+it returns 200 with `{"progress": x}` while running. But the
+reference project accepts 202, the HTTP standard defines it as
+"Accepted", and the cost of accepting it is one extra branch. When
+the server behavior is uncertain, staying on the permissive side of
+the HTTP standard is the safer default.
+
+**Revisit if**: BRAIN starts returning 202 with a meaningful body
+(e.g. a queue position). Then that body is parsed in the 202 branch;
+do not move the branch order back.

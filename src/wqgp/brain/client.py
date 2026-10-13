@@ -14,8 +14,17 @@ Design decisions:
 - Each task is bounded by max_polls AND poll_timeout_seconds; sleep_fn
   is injectable for tests. See D-077.
 - Server rejections produce TaskResult(status=FAILED). Auth failures
-  raise BrainAuthError, which __call__ propagates unchanged. See D-078
-  and D-080.
+  raise BrainAuthError, which __call__ propagates unchanged. See
+  D-078 and D-080.
+- Poll responses have two shapes: {"progress": float} while running,
+  {"status": "COMPLETE", "alpha": "<id>"} when done. Metrics are NOT
+  in the poll response; a second GET /alphas/{id} is required. See
+  D-110.
+- WARNING with a non-empty message is a terminal failure, not a
+  continuing state. See D-111.
+- A semaphore bounds simultaneously active simulations. See D-112.
+- BrainSettings defaults match BRAIN's observed-accepted values.
+  See D-113.
 """
 from __future__ import annotations
 
@@ -52,6 +61,16 @@ class BrainProtocolError(BrainClientError):
     """Raised when a server response does not fit the expected shape."""
 
 
+class BrainConcurrencyLimitError(BrainClientError):
+    """Raised on 429 + CONCURRENT_SIMULATION_LIMIT_EXCEEDED.
+
+    Distinct from a generic rate limit because BRAIN's message is
+    specific: the account has too many active simulations. The
+    semaphore (D-112) should prevent this in normal operation; seeing
+    it means the configured max_concurrent is too high for the account.
+    """
+
+
 # --- config -----------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
@@ -80,13 +99,18 @@ class BrainCredentials:
 
 @dataclass(frozen=True, slots=True)
 class BrainSettings:
-    """Frozen simulation settings. Type-only validation (see D-074)."""
+    """Frozen simulation settings.
+
+    Defaults (decay=4, neutralization="INDUSTRY") match values observed
+    to be accepted by BRAIN's /simulations endpoint for a TUTORIAL
+    account. See D-113.
+    """
     instrument_type: str = "EQUITY"
     region: str = "USA"
     universe: str = "TOP3000"
     delay: int = 1
-    decay: int = 0
-    neutralization: str = "SUBINDUSTRY"
+    decay: int = 4
+    neutralization: str = "INDUSTRY"
     truncation: float = 0.08
     pasteurization: str = "ON"
     nan_handling: str = "OFF"
@@ -169,9 +193,11 @@ _SIMULATIONS_URL = f"{_BASE_URL}/simulations"
 class BrainClient:
     """Implements the Evaluator protocol against the BRAIN API.
 
-    Thread-safety: `__call__` may be invoked from multiple worker threads
-    concurrently. Login state is guarded by an internal lock; the rest of
-    the request flow is stateless apart from that flag.
+    Thread-safety:
+    - Login state is guarded by a lock.
+    - Active simulations are bounded by a semaphore (D-112).
+    Both are reentrant-safe; multiple worker threads may call the
+    client concurrently.
     """
 
     __slots__ = (
@@ -184,6 +210,8 @@ class BrainClient:
         "_poll_timeout_seconds",
         "_base_poll_interval",
         "_http_timeout",
+        "_max_concurrent",
+        "_concurrency_semaphore",
         "_authenticated",
         "_lock",
     )
@@ -198,8 +226,9 @@ class BrainClient:
         sleep_fn: Callable[[float], None] = time.sleep,
         max_polls: int = 120,
         poll_timeout_seconds: float = 600.0,
-        base_poll_interval: float = 1.0,
+        base_poll_interval: float = 3.0,
         http_timeout: float = 30.0,
+        max_concurrent: int = 2,
     ) -> None:
         if max_polls < 1:
             raise ValueError("max_polls must be >= 1")
@@ -209,6 +238,8 @@ class BrainClient:
             raise ValueError("base_poll_interval must be > 0")
         if http_timeout <= 0:
             raise ValueError("http_timeout must be > 0")
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be >= 1")
 
         self._credentials = credentials
         self._settings = settings
@@ -219,6 +250,8 @@ class BrainClient:
         self._poll_timeout_seconds = poll_timeout_seconds
         self._base_poll_interval = base_poll_interval
         self._http_timeout = http_timeout
+        self._max_concurrent = max_concurrent
+        self._concurrency_semaphore = threading.BoundedSemaphore(max_concurrent)
         self._authenticated = False
         self._lock = threading.Lock()
 
@@ -230,23 +263,27 @@ class BrainClient:
     # --- Evaluator Protocol -------------------------------------------
 
     def __call__(self, task: Task) -> TaskResult:
-        # Login failures raise: the Executor's D-034 handler records
-        # this task as FAILED, and a subsequent task will retry login.
         self._ensure_authenticated()
 
+        # Bound simultaneously active simulations. A slot is held
+        # across the whole submit+poll cycle, not just the POST. See
+        # D-112.
+        self._concurrency_semaphore.acquire()
         try:
-            sim = self._submit_and_poll(task.expression)
-        except BrainAuthError:
-            # Auth failure during submit/poll is a distinct channel:
-            # propagate it unchanged so it is not confused with a
-            # per-expression failure. See D-078 and D-080.
-            raise
-        except BrainClientError as e:
-            return TaskResult(
-                fingerprint=task.fingerprint,
-                status=TaskStatus.FAILED,
-                error=str(e),
-            )
+            try:
+                sim = self._submit_and_poll(task.expression)
+            except BrainAuthError:
+                # Auth failure during submit/poll is a distinct channel:
+                # propagate unchanged. See D-078 and D-080.
+                raise
+            except BrainClientError as e:
+                return TaskResult(
+                    fingerprint=task.fingerprint,
+                    status=TaskStatus.FAILED,
+                    error=str(e),
+                )
+        finally:
+            self._concurrency_semaphore.release()
 
         if sim.error_message is not None:
             return TaskResult(
@@ -325,6 +362,18 @@ class BrainClient:
         if resp.status_code == 401:
             self._invalidate_auth()
             raise BrainAuthError("submit rejected: not authenticated")
+
+        if resp.status_code == 429:
+            detail = _extract_error_detail(resp)
+            if "CONCURRENT_SIMULATION_LIMIT_EXCEEDED" in detail:
+                raise BrainConcurrencyLimitError(
+                    f"concurrent simulation limit exceeded: "
+                    f"{detail or 'no detail'}"
+                )
+            raise BrainClientError(
+                f"submit rate limited (429): {detail or _safe_text(resp)}"
+            )
+
         if resp.status_code not in (200, 201):
             raise BrainClientError(
                 f"submit failed with HTTP {resp.status_code}: "
@@ -355,33 +404,133 @@ class BrainClient:
                 consecutive_errors = 0
             except TransportError:
                 consecutive_errors += 1
-                self._sleep_fn(
-                    self._backoff(consecutive_errors)
-                )
+                self._sleep_fn(self._backoff(consecutive_errors))
                 continue
 
             if resp.status_code == 401:
                 self._invalidate_auth()
                 raise BrainAuthError("poll rejected: not authenticated")
 
-            if resp.status_code == 200:
-                return self._parse_result(resp)
-
-            if resp.status_code in (201, 202):
+            # 202 = accepted, not done. No body to parse; just wait.
+            # BRAIN observed in practice returns 200 + progress instead
+            # of 202, but the reference project still accepts 202 and
+            # the HTTP semantics ("accepted") fit our loop. See D-114.
+            if resp.status_code == 202:
                 self._sleep_fn(self._next_poll_interval(resp))
                 continue
 
-            if 500 <= resp.status_code < 600:
-                consecutive_errors += 1
-                self._sleep_fn(self._backoff(consecutive_errors))
+            if resp.status_code != 200:
+                if 500 <= resp.status_code < 600:
+                    consecutive_errors += 1
+                    self._sleep_fn(self._backoff(consecutive_errors))
+                    continue
+                raise BrainClientError(
+                    f"poll failed with HTTP {resp.status_code}: "
+                    f"{_safe_text(resp)}"
+                )
+
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise BrainProtocolError(
+                    f"poll returned non-JSON body: {e}"
+                ) from e
+
+            if not isinstance(data, dict):
+                raise BrainProtocolError(
+                    f"poll returned {type(data).__name__}, expected object"
+                )
+
+            status = data.get("status")
+
+            # ---- ERROR: terminal failure ----
+            if status == "ERROR":
+                msg = (
+                    data.get("message")
+                    or data.get("error")
+                    or "simulation ERROR"
+                )
+                return SimulationResult(
+                    alpha_id=None,
+                    metrics=(),
+                    error_message=str(msg),
+                )
+
+            # ---- WARNING: terminal if it carries a message (D-111) ----
+            if status == "WARNING":
+                msg = data.get("message", "")
+                if msg:
+                    return SimulationResult(
+                        alpha_id=None,
+                        metrics=(),
+                        error_message=str(msg),
+                    )
+                # No message: treat as still-running and keep polling.
+                self._sleep_fn(self._next_poll_interval(resp))
                 continue
 
+            # ---- COMPLETE: fetch metrics in a second request (D-110) ----
+            if status == "COMPLETE":
+                alpha_id = data.get("alpha")
+                if not isinstance(alpha_id, str) or not alpha_id:
+                    raise BrainProtocolError(
+                        "COMPLETE response without 'alpha' id"
+                    )
+                return self._fetch_alpha_metrics(alpha_id)
+
+            # ---- No status: {"progress": float}, keep waiting ----
+            self._sleep_fn(self._next_poll_interval(resp))
+
+        raise BrainClientError(f"poll exceeded {self._max_polls} attempts")
+
+    def _fetch_alpha_metrics(self, alpha_id: str) -> SimulationResult:
+        """GET /alphas/{id} for the in-sample metrics block (D-110)."""
+        url = f"{_BASE_URL}/alphas/{alpha_id}"
+        try:
+            resp = self._transport.request(
+                "GET", url, timeout=self._http_timeout
+            )
+        except TransportError as e:
             raise BrainClientError(
-                f"poll failed with HTTP {resp.status_code}: "
+                f"alpha fetch transport error: {e}"
+            ) from e
+
+        if resp.status_code == 401:
+            self._invalidate_auth()
+            raise BrainAuthError("alpha fetch rejected: not authenticated")
+        if resp.status_code != 200:
+            raise BrainClientError(
+                f"alpha fetch failed with HTTP {resp.status_code}: "
                 f"{_safe_text(resp)}"
             )
 
-        raise BrainClientError(f"poll exceeded {self._max_polls} attempts")
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise BrainProtocolError(
+                f"alpha response non-JSON: {e}"
+            ) from e
+
+        if not isinstance(data, dict):
+            raise BrainProtocolError("alpha response is not an object")
+
+        metrics_raw = data.get("is")
+        if not isinstance(metrics_raw, dict):
+            raise BrainProtocolError(
+                "alpha response missing 'is' block"
+            )
+
+        metrics: list[tuple[str, float]] = []
+        for k, v in metrics_raw.items():
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                metrics.append((str(k), float(v)))
+
+        return SimulationResult(
+            alpha_id=alpha_id,
+            metrics=tuple(metrics),
+        )
 
     def _next_poll_interval(self, resp: HttpResponse) -> float:
         """Honor Retry-After; fall back to base_poll_interval."""
@@ -397,56 +546,18 @@ class BrainClient:
         """Exponential backoff, capped so tests can't hang."""
         return min(self._base_poll_interval * (2 ** (attempt - 1)), 30.0)
 
-    def _parse_result(self, resp: HttpResponse) -> SimulationResult:
-        try:
-            data = resp.json()
-        except ValueError as e:
-            raise BrainProtocolError(
-                f"poll returned non-JSON body: {e}"
-            ) from e
 
-        if not isinstance(data, dict):
-            raise BrainProtocolError(
-                f"poll returned {type(data).__name__}, expected object"
-            )
-
-        # Explicit server-side error status.
-        status = data.get("status")
-        if isinstance(status, str) and status.upper() in {
-            "ERROR", "FAIL", "FAILED", "CANCELLED",
-        }:
-            msg = (
-                data.get("message")
-                or data.get("error")
-                or f"simulation status={status}"
-            )
-            return SimulationResult(
-                alpha_id=None,
-                metrics=(),
-                error_message=str(msg),
-            )
-
-        metrics_raw = data.get("is")
-        if not isinstance(metrics_raw, dict):
-            raise BrainProtocolError(
-                "poll response missing 'is' block"
-            )
-
-        metrics: list[tuple[str, float]] = []
-        for k, v in metrics_raw.items():
-            if isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                metrics.append((str(k), float(v)))
-
-        alpha_id = data.get("id")
-        if alpha_id is not None and not isinstance(alpha_id, str):
-            alpha_id = None
-
-        return SimulationResult(
-            alpha_id=alpha_id,
-            metrics=tuple(metrics),
-        )
+def _extract_error_detail(resp: HttpResponse) -> str:
+    """Read BRAIN's {'detail': '...'} error body, or fall back to text."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return _safe_text(resp)
+    if isinstance(data, dict):
+        detail = data.get("detail")
+        if isinstance(detail, str):
+            return detail
+    return _safe_text(resp)
 
 
 def _safe_text(resp: HttpResponse) -> str:
@@ -463,6 +574,7 @@ def build_default_client(
     *,
     settings: BrainSettings | None = None,
     fitness_fn: FitnessFunction = default_fitness,
+    max_concurrent: int = 2,
 ) -> BrainClient:
     """Construct a BrainClient wired to real HTTP and environment creds."""
     return BrainClient(
@@ -470,4 +582,5 @@ def build_default_client(
         settings=settings or BrainSettings(),
         transport=RequestsTransport(),
         fitness_fn=fitness_fn,
+        max_concurrent=max_concurrent,
     )

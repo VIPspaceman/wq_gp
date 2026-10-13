@@ -235,7 +235,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bp.add_argument(
         "--page-limit",
         type=int,
-        default=500,
+        default=50,
         help=(
             "page size for paginated endpoints (default: 500). "
             "BRAIN limits requests per minute; a large page size "
