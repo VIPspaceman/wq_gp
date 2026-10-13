@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import pytest
 
@@ -30,8 +31,10 @@ from wqgp.execution import Task, TaskStatus
 class ScriptedTransport:
     """Test double for HttpTransport.
 
-    Register responses in FIFO order per (method, url-prefix). Every
+    Register responses in FIFO order per (method, url-path-prefix). Every
     request pops the next queued response. Records every call.
+
+    Prefixes are URL PATHS ("/authentication"), not full URLs. See D-079.
     """
     calls: list[tuple[str, str, dict[str, Any]]] = field(
         default_factory=list
@@ -59,8 +62,12 @@ class ScriptedTransport:
                 "auth": auth,
             })
         )
+        # Match against the URL's PATH, not the full URL. Registered
+        # prefixes are paths ("/authentication"), while the client sends
+        # absolute URLs ("https://api.../authentication"). See D-079.
+        path = urlparse(url).path
         for (m, prefix), q in self._queues.items():
-            if m == method.upper() and url.startswith(prefix) and q:
+            if m == method.upper() and path.startswith(prefix) and q:
                 item = q.pop(0)
                 if isinstance(item, Exception):
                     raise item

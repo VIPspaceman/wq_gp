@@ -1,0 +1,1 @@
+conda deactivate && cd .. && source .venv/bin/activate && cd wq_gp

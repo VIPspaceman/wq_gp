@@ -1521,3 +1521,269 @@ improvement in N generations). Then add a fourth reason, and consider
 making the check the responsibility of a dedicated "stop policy"
 object rather than inline code. Do NOT add a fourth `if` to this
 function without that refactor.
+
+---
+
+## D-071 — BrainClient depends on HttpTransport, not on requests
+
+**Decision**: `HttpTransport` is a `typing.Protocol` with one
+`request()` method plus `close()`. `BrainClient` takes a transport in
+its constructor. The production implementation is `RequestsTransport`;
+tests inject a `ScriptedTransport` that returns canned responses.
+
+**Why**: an HTTP client that imports `requests` directly is untestable
+without monkeypatching. Monkeypatching `requests.Session.request` is
+brittle — it couples tests to the version of requests installed and
+makes parallel test runs racy. A Protocol + injection keeps every test
+pure Python, no I/O, no patching.
+
+The same pattern is used elsewhere in this project (D-033 for
+`Evaluator`). Consistency matters: a reader who knows how the evaluator
+is tested already knows how the transport is tested.
+
+**Revisit if**: we adopt an async runtime. Then the Protocol gains an
+`async def request(...)` and everything above it changes shape.
+That is a rewrite, not an extension; do not start it until there is a
+measured need.
+
+---
+
+## D-072 — Session cookies are owned by the transport
+
+**Decision**: `RequestsTransport` wraps a `requests.Session`. That
+session persists cookies (including BRAIN's JWT) across calls. The
+`BrainClient` never reads or writes a cookie directly.
+
+**Why**: cookie handling is a transport concern — it depends on the
+specific HTTP library. The client only needs "authenticated or not",
+which it tracks as a boolean. Any change in how BRAIN issues or
+refreshes tokens is confined to the transport.
+
+This also means `ScriptedTransport` does not need to simulate cookies.
+Tests that need to verify "login happens once" count the number of
+POSTs to `/authentication`, which is clearer than inspecting cookies.
+
+**Revisit if**: BRAIN moves from cookie-based sessions to bearer tokens
+in a header. Then the transport gains token injection and the client
+gains token refresh logic. Both changes stay inside the respective
+classes.
+
+---
+
+## D-073 — BrainCredentials has from_env()
+
+**Decision**: `BrainCredentials` is a frozen dataclass with
+`username` and `password`. `from_env()` reads `WQ_BRAIN_USERNAME` and
+`WQ_BRAIN_PASSWORD`. `build_default_client()` uses `from_env()`.
+
+**Why**: environment variables are the standard for secrets in a CLI /
+daemon context. Putting the env-var names in one classmethod, rather
+than scattering `os.environ.get(...)` calls, makes the contract
+explicit and testable via `monkeypatch.setenv`.
+
+The environment-variable prefix `WQ_BRAIN_` matches the reference
+project and is unlikely to collide with anything else on a developer's
+machine.
+
+**Revisit if**: we need multiple accounts (e.g. one for exploration,
+one for production). Then change `BrainClient.__init__` to take a
+`credentials` and let the caller decide where they came from. Do NOT
+add more env-var names to `from_env`.
+
+---
+
+## D-074 — BrainSettings validation is type-only
+
+**Decision**: `BrainSettings` validates that fields have the right
+Python type and that numeric ranges are sane (`delay >= 0`,
+`0 <= truncation <= 1`). It does NOT enumerate the allowed values for
+`region`, `universe`, `neutralization`, and the like.
+
+**Why**: BRAIN's allowed values for those fields change over time —
+regions get added, universes get retired. If we hardcoded the list,
+the client would break on every platform update. Type-only validation
+catches the mistakes that are ours to catch (a typo that produces an
+int where a string is expected) and leaves the platform to reject
+values it does not accept. The client already surfaces those
+rejections as `TaskResult(FAILED)`.
+
+**Revisit if**: BRAIN publishes a stable, versioned list of allowed
+values (e.g. a `/settings` endpoint). At that point we can fetch the
+list at startup and validate against it. Do NOT hardcode a copy.
+
+---
+
+## D-075 — Fitness is a pluggable FitnessFunction
+
+**Decision**: `BrainClient` takes a `fitness_fn: MetricsView -> float |
+None`. The default returns `metrics["sharpe"]` or `None`. Callers can
+supply a composite (e.g. weighted sum of sharpe and returns).
+
+**Why**: "what makes a good alpha" is a research decision, not a
+client decision. Baking `sharpe` into the client would force every
+researcher who prefers a different metric to fork the client. A
+one-argument callable is the smallest interface that supports the
+range of choices we expect.
+
+Returning `None` from the callable is a legitimate signal: "these
+metrics do not meet the minimum bar for fitness". The client converts
+that into a `FAILED` TaskResult with a clear message, rather than
+inventing a default. Silent substitution of a default would let
+degenerate alphas pass into the population.
+
+**Revisit if**: we want to store multiple fitnesses per evaluation
+(e.g. one per objective). Then `FitnessFunction` returns a tuple, and
+`EvaluationRecord` gains a second fitness column. Both changes ship
+together.
+
+---
+
+## D-076 — Poll interval from Retry-After, backoff on transient errors
+
+**Decision**: when a poll returns 201 or 202, the next sleep duration
+comes from the `Retry-After` header (parsed as seconds). If the header
+is missing or malformed, fall back to `base_poll_interval`. On a
+transport error or 5xx response, sleep for
+`base_poll_interval * 2^(attempt-1)`, capped at 30 seconds.
+
+**Why**: BRAIN's poll responses carry a `Retry-After` that reflects
+its own internal queue depth. Honoring it is both polite and faster
+than a fixed interval — the server tells us when to come back.
+Falling back to `base_poll_interval` (default 1.0s) keeps us from
+busy-looping on a server that forgot the header.
+
+Exponential backoff on errors is standard for transient failures. The
+30-second cap is there to prevent a pathological run of errors from
+sleeping for minutes, which would look like a hang.
+
+**Revisit if**: BRAIN changes the header name or starts returning
+milliseconds. Then this function needs one more branch. Do NOT add a
+second backoff policy — extend this one.
+
+---
+
+## D-077 — Each task is bounded by max_polls AND poll_timeout_seconds
+
+**Decision**: `_poll` gives up after `max_polls` iterations OR when
+`time.monotonic()` exceeds a deadline set at the start of the poll.
+Both limits are configurable; tests set `max_polls` small and
+`poll_timeout_seconds` large.
+
+**Why**: two independent failure modes need two bounds. A fast-but-
+infinite loop (server always returns 202 immediately) burns CPU and
+API quota; `max_polls` catches that. A slow-but-eventually-doomed
+poll (server returns 202 with Retry-After 60 for hours) burns
+wall-clock time; the deadline catches that. Neither bound alone is
+sufficient.
+
+`sleep_fn` is injectable so tests can pass `lambda _s: None` and
+control timing without real waits. This is the standard pattern for
+testing code that sleeps; the alternative — patching `time.sleep` —
+is fragile under parallel test runners.
+
+**Revisit if**: we add per-simulation scheduling (e.g. batch submit,
+then poll all). Then the deadline should be computed once for the
+batch, not per simulation. That is a bigger change than it looks;
+defer until concrete need.
+
+---
+
+## D-078 — Error taxonomy: task failures return, auth failures raise
+
+**Decision**: two categories of error, two channels.
+
+- **Server-side rejection of one simulation** (bad expression, invalid
+  settings, simulation status = ERROR, missing `is` block) →
+  `TaskResult(status=FAILED, error=...)`. The pipeline keeps running.
+- **Authentication failure** (login fails, a poll returns 401) →
+  `BrainAuthError` raised. The Executor's D-034 handler catches it,
+  records this task as FAILED, and moves on.
+- **Client / protocol failures** (5xx exhausted retries, missing
+  Location header, malformed JSON) → return `TaskResult(FAILED)` too,
+  with the error message.
+
+**Why**: the pipeline's job is to keep evaluating. Almost no error
+should kill a worker thread. The one exception — auth — is still
+caught by D-034, but raising it as a distinct type makes the intent
+visible in logs: "this is not a bad expression, this is a session
+problem, check the credentials".
+
+Distinguishing by return value vs. raise also encodes intent at the
+call site. A reader of `BrainClient.__call__` can see at a glance that
+server rejections are values, not exceptions.
+
+**Revisit if**: we add retry budgets for auth (e.g. re-login up to 3
+times on 401 before giving up). Then `BrainAuthError` becomes
+transient in some cases, and the client needs to decide based on its
+own state. That is a client change, not a taxonomy change.
+
+---
+
+## D-079 — Test transports match on URL path, not full URL
+
+**Decision**: `ScriptedTransport` (the test double for `HttpTransport`)
+extracts the path via `urllib.parse.urlparse(url).path` and matches
+registered prefixes against that path. It does NOT call
+`url.startswith(prefix)` on the full URL.
+
+**Why**: the test registers prefixes like `/authentication` and
+`/simulations/123`, because those are the meaningful parts of a request.
+The production client sends absolute URLs like
+`https://api.worldquantbrain.com/authentication`, because that is what
+`requests` expects. `full_url.startswith("/authentication")` is False
+for every request, so every queue lookup missed and all 16 BrainClient
+tests failed with "no scripted response".
+
+Path-based matching also avoids a subtler bug that string-prefix
+matching would introduce: `/simulations` is a prefix of
+`/simulations/123`, so a full-string match on a bare `/simulations`
+prefix would incorrectly match a specific-simulation request. Path +
+`startswith` has the same textual subtlety, but the caller controls
+specificity by registering the more specific path first when both
+queues are live. In practice the method discriminator (`GET` vs `POST`)
+already separates the two.
+
+**Revisit if**: the client starts sending query strings that
+distinguish endpoints (e.g. `/simulations?type=X` vs `?type=Y`). Then
+the test transport should match on `parsed.path` AND `parsed.query`,
+and the registered keys should become `(method, path, query)` tuples.
+Do NOT extend the current prefix scheme to cover query strings.
+
+---
+
+---
+
+## D-080 — BrainAuthError re-raises before the generic handler
+
+**Decision**: `BrainClient.__call__` catches `BrainAuthError` explicitly
+and re-raises it, BEFORE the `except BrainClientError` clause that
+converts other errors into `TaskResult(FAILED)`.
+
+**Why**: `BrainAuthError` is a subclass of `BrainClientError` (D-078
+keeps them in one family), so Python's `except BrainClientError` clause
+catches auth errors too if it appears first. The original implementation
+put only the generic clause around `_submit_and_poll`, so a 401 during
+submit or poll was silently converted into a `TaskResult(FAILED)` and
+never reached the caller.
+
+The two-channel design in D-078 is that auth failures go through the
+*raise* channel so they are visibly different from per-expression
+failures in logs and from any outer-level credential check. The clause
+order is what implements that design. Order matters; a future edit
+that reorders or merges these clauses would silently break D-078 again.
+
+The alternative — making `BrainAuthError` inherit directly from
+`RuntimeError` instead of `BrainClientError` — was considered and
+rejected. It would break the semantic "auth error is a client error"
+relation, and it would not protect against a future `except` clause
+that catches `RuntimeError`. Explicit ordering is the standard Python
+idiom for distinguishing a subtype in a try/except chain, and it keeps
+the exception hierarchy intuitive.
+
+**Revisit if**: a second "must-raise" subtype appears (e.g.
+`BrainRateLimitError` that should also escape the FAILED conversion).
+At that point, extract a tuple `_RAISING_ERRORS = (BrainAuthError,
+BrainRateLimitError)` and write `except _RAISING_ERRORS: raise`. Do
+NOT start a chain of individual clauses.
+
+---

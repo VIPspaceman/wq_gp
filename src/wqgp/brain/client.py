@@ -14,11 +14,13 @@ Design decisions:
 - Each task is bounded by max_polls AND poll_timeout_seconds; sleep_fn
   is injectable for tests. See D-077.
 - Server rejections produce TaskResult(status=FAILED). Auth failures
-  raise BrainAuthError. See D-078.
+  raise BrainAuthError, which __call__ propagates unchanged. See D-078
+  and D-080.
 """
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -39,7 +41,11 @@ class BrainClientError(RuntimeError):
 
 
 class BrainAuthError(BrainClientError):
-    """Raised on authentication failure. Bubbles to the Executor."""
+    """Raised on authentication failure. Propagates out of __call__.
+
+    Note: this is a subclass of BrainClientError, but __call__ re-raises
+    it before the generic BrainClientError handler. See D-080.
+    """
 
 
 class BrainProtocolError(BrainClientError):
@@ -163,9 +169,9 @@ _SIMULATIONS_URL = f"{_BASE_URL}/simulations"
 class BrainClient:
     """Implements the Evaluator protocol against the BRAIN API.
 
-    Thread-safety: this class is NOT thread-safe because login state
-    changes on the first call. The Executor runs it from N worker
-    threads; guard login with the lock inside `_ensure_authenticated`.
+    Thread-safety: `__call__` may be invoked from multiple worker threads
+    concurrently. Login state is guarded by an internal lock; the rest of
+    the request flow is stateless apart from that flag.
     """
 
     __slots__ = (
@@ -204,7 +210,6 @@ class BrainClient:
         if http_timeout <= 0:
             raise ValueError("http_timeout must be > 0")
 
-        import threading
         self._credentials = credentials
         self._settings = settings
         self._transport = transport
@@ -225,16 +230,17 @@ class BrainClient:
     # --- Evaluator Protocol -------------------------------------------
 
     def __call__(self, task: Task) -> TaskResult:
-        try:
-            self._ensure_authenticated()
-        except BrainAuthError:
-            # Auth failure is fatal for the whole run; let the Executor
-            # record it as FAILED for this task and keep going. A
-            # subsequent task will retry login.
-            raise
+        # Login failures raise: the Executor's D-034 handler records
+        # this task as FAILED, and a subsequent task will retry login.
+        self._ensure_authenticated()
 
         try:
             sim = self._submit_and_poll(task.expression)
+        except BrainAuthError:
+            # Auth failure during submit/poll is a distinct channel:
+            # propagate it unchanged so it is not confused with a
+            # per-expression failure. See D-078 and D-080.
+            raise
         except BrainClientError as e:
             return TaskResult(
                 fingerprint=task.fingerprint,
