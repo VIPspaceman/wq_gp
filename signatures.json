@@ -1,13 +1,57 @@
 {
   "schema_version": 1,
   "operators": [
-    {
-      "name": "add",
-      "input_types": ["MATRIX", "MATRIX"],
-      "output_type": "MATRIX",
-      "commutative": true,
-      "associative": true,
-      "symmetric": true
-    }
+    {"name": "add",      "input_types": ["MATRIX", "MATRIX"], "output_type": "MATRIX",
+     "commutative": true, "associative": true, "symmetric": true},
+    {"name": "subtract", "input_types": ["MATRIX", "MATRIX"], "output_type": "MATRIX"},
+    {"name": "multiply", "input_types": ["MATRIX", "MATRIX"], "output_type": "MATRIX",
+     "commutative": true, "associative": true, "symmetric": true},
+    {"name": "divide",   "input_types": ["MATRIX", "MATRIX"], "output_type": "MATRIX"},
+    {"name": "power",    "input_types": ["MATRIX", "MATRIX"], "output_type": "MATRIX"},
+    {"name": "signed_power", "input_types": ["MATRIX", "MATRIX"], "output_type": "MATRIX"},
+    {"name": "max",      "input_types": ["MATRIX", "MATRIX"], "output_type": "MATRIX",
+     "commutative": true, "associative": true, "symmetric": true},
+    {"name": "min",      "input_types": ["MATRIX", "MATRIX"], "output_type": "MATRIX",
+     "commutative": true, "associative": true, "symmetric": true},
+
+    {"name": "log",      "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "sqrt",     "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "abs",      "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "sign",     "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "reverse",  "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "inverse",  "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "normalize","input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "scale",    "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "winsorize","input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "hump",     "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "is_nan",   "input_types": ["MATRIX"], "output_type": "MATRIX"},
+
+    {"name": "rank",     "input_types": ["MATRIX"], "output_type": "MATRIX"},
+    {"name": "zscore",   "input_types": ["MATRIX"], "output_type": "MATRIX"},
+
+    {"name": "days_from_last_change", "input_types": ["MATRIX"], "output_type": "MATRIX"},
+
+    {"name": "ts_mean",        "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 5}}},
+    {"name": "ts_std_dev",     "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 20}}},
+    {"name": "ts_delta",       "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 5}}},
+    {"name": "ts_delay",       "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 1}}},
+    {"name": "ts_sum",         "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 5}}},
+    {"name": "ts_rank",        "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 20}}},
+    {"name": "ts_zscore",      "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 20}}},
+    {"name": "ts_decay_linear","input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 10}}},
+    {"name": "ts_product",     "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 5}}},
+    {"name": "ts_arg_max",     "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 20}}},
+    {"name": "ts_arg_min",     "input_types": ["MATRIX"], "output_type": "MATRIX",
+     "param_domains": {"window": {"kind": "INT_RANGE", "min_value": 1, "max_value": 512, "default": 20}}}
   ]
 }

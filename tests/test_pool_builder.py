@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from tests._fakes import ScriptedTransport
-from wqgp.brain.client import BrainCredentials
+from wqgp.brain.client import BrainCredentials, BrainSettings
 from wqgp.brain.pool_builder import (
     OperatorSignatureTable,
     PoolBuilder,
@@ -491,6 +491,79 @@ def test_fetch_stops_when_server_ignores_pagination() -> None:
     assert pages == 2
     assert {f.field_id for f in fields} == {"op0", "op1", "op2"}
     assert dropped == ()
+
+def test_fetch_fields_includes_settings_in_query() -> None:
+    """The /data-fields endpoint requires instrumentType, region,
+    delay, universe as query parameters. See D-107."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect(
+        "GET", "/data-fields",
+        _page([_field("close")]),
+    )
+
+    b = PoolBuilder(
+        credentials=_creds(),
+        transport=t,
+        settings=BrainSettings(
+            instrument_type="EQUITY",
+            region="USA",
+            universe="TOP3000",
+            delay=1,
+        ),
+        page_limit=50,
+        max_pages=10,
+    )
+    b.fetch_fields()
+
+    urls = [url for method, url, _ in t.calls if method == "GET"]
+    assert len(urls) == 1
+    url = urls[0]
+    assert "instrumentType=EQUITY" in url
+    assert "region=USA" in url
+    assert "delay=1" in url
+    assert "universe=TOP3000" in url
+    assert "limit=50" in url
+    assert "offset=0" in url
+
+
+def test_fetch_operators_omits_settings_from_query() -> None:
+    """The /operators endpoint does not accept settings parameters;
+    sending them would be harmless but we don't. See D-107."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect("GET", "/operators", _page([{"name": "add"}]))
+
+    b = PoolBuilder(
+        credentials=_creds(),
+        transport=t,
+        settings=BrainSettings(region="CHN"),
+        page_limit=50,
+        max_pages=10,
+    )
+    b.fetch_operator_names()
+
+    urls = [
+        url for method, url, _ in t.calls
+        if method == "GET" and "/operators" in url
+    ]
+    assert len(urls) == 1
+    assert "region" not in urls[0]
+
+
+def test_builder_settings_default_is_usa_top3000() -> None:
+    """Constructor without settings uses BrainSettings defaults."""
+    t = ScriptedTransport()
+    t.expect("POST", "/authentication", _login_ok())
+    t.expect("GET", "/data-fields", _page([_field("close")]))
+
+    b = PoolBuilder(credentials=_creds(), transport=t)
+    b.fetch_fields()
+
+    urls = [url for method, url, _ in t.calls if method == "GET"]
+    assert "region=USA" in urls[0]
+    assert "universe=TOP3000" in urls[0]
+    assert "delay=1" in urls[0]
 
 
 def test_fetch_transport_error_raises() -> None:

@@ -15,6 +15,8 @@ Design decisions:
   the environment. See D-097.
 - `signatures` subcommand audits a signature table; it never writes
   the file. See D-102.
+- `build-pool` accepts simulation settings flags; /data-fields needs
+  them. See D-107.
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ from wqgp import __version__
 from wqgp.brain.client import (
     BrainAuthError,
     BrainCredentials,
+    BrainSettings,
     build_default_client,
 )
 from wqgp.brain.pool_builder import (
@@ -148,7 +151,49 @@ def _require(
     return v
 
 
+def _settings_from_args(args: argparse.Namespace) -> BrainSettings:
+    """Build a BrainSettings from the flags that build-pool accepts.
+    Defaults come from BrainSettings itself so there is one source of
+    truth for what 'USA / TOP3000 / delay 1' means."""
+    defaults = BrainSettings()
+    return BrainSettings(
+        instrument_type=getattr(args, "instrument_type", None)
+        or defaults.instrument_type,
+        region=getattr(args, "region", None) or defaults.region,
+        universe=getattr(args, "universe", None) or defaults.universe,
+        delay=getattr(args, "delay", None)
+        if getattr(args, "delay", None) is not None
+        else defaults.delay,
+    )
+
+
 # --- argument parser --------------------------------------------------------
+
+def _add_settings_flags(p: argparse.ArgumentParser) -> None:
+    """Attach the four flags /data-fields needs (D-107)."""
+    defaults = BrainSettings()
+    p.add_argument(
+        "--instrument-type",
+        default=None,
+        help=f"instrument type (default: {defaults.instrument_type})",
+    )
+    p.add_argument(
+        "--region",
+        default=None,
+        help=f"region (default: {defaults.region})",
+    )
+    p.add_argument(
+        "--universe",
+        default=None,
+        help=f"universe (default: {defaults.universe})",
+    )
+    p.add_argument(
+        "--delay",
+        type=int,
+        default=None,
+        help=f"delay (default: {defaults.delay})",
+    )
+
 
 def _build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
@@ -199,6 +244,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=200,
         help="hard cap on pages per endpoint (default: 200)",
     )
+    _add_settings_flags(p_bp)
     p_bp.set_defaults(handler=_cmd_build_pool)
 
     # run
@@ -334,15 +380,19 @@ def _cmd_build_pool(args: argparse.Namespace) -> int:
     except BrainAuthError as e:
         raise CliError(str(e)) from e
 
+    settings = _settings_from_args(args)
     transport = _make_transport(args)
     builder = PoolBuilder(
         credentials=creds,
         transport=transport,
+        settings=settings,
         page_limit=args.page_limit,
         max_pages=args.max_pages,
     )
     try:
         result = builder.build(signatures)
+    except (PoolBuilderError, PoolBuilderProtocolError) as e:
+        raise CliError(f"failed to build pool: {e}") from e
     finally:
         builder.close()
 
@@ -351,6 +401,11 @@ def _cmd_build_pool(args: argparse.Namespace) -> int:
     result.pool.save(out_path)
 
     log.info("wrote pool to %s", out_path)
+    log.info(
+        "settings: instrument_type=%s region=%s universe=%s delay=%d",
+        settings.instrument_type, settings.region,
+        settings.universe, settings.delay,
+    )
     for k, v in result.summary().items():
         log.info("  %s: %s", k, v)
     return EXIT_OK

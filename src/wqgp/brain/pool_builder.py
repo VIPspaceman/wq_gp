@@ -11,6 +11,8 @@ Design decisions:
 - If a page equals the previous page byte-for-byte, the server is
   ignoring limit/offset; we treat the first page as the whole result.
   See D-106.
+- /data-fields requires simulation settings as query parameters; the
+  builder takes an optional BrainSettings. See D-107.
 
 BRAIN does not return operator type signatures. The /operators endpoint
 gives names and descriptions only. Without signatures, an OperatorDef
@@ -29,6 +31,7 @@ from wqgp.brain.client import (
     BrainAuthError,
     BrainClientError,
     BrainCredentials,
+    BrainSettings,
     _BASE_URL,
     _LOGIN_URL,
 )
@@ -201,13 +204,23 @@ def _extract_items(payload: Any, endpoint: str) -> list[Any]:
     )
 
 
+def _settings_query(settings: BrainSettings) -> dict[str, str]:
+    """Render the settings the /data-fields endpoint expects."""
+    return {
+        "instrumentType": settings.instrument_type,
+        "region": settings.region,
+        "delay": str(settings.delay),
+        "universe": settings.universe,
+    }
+
+
 # --- builder ----------------------------------------------------------------
 
 class PoolBuilder:
     """Fetches BRAIN's data fields and operators, and builds a Pool.
 
     Lifecycle:
-        builder = PoolBuilder(credentials, transport)
+        builder = PoolBuilder(credentials, transport, settings)
         result = builder.build(signatures)
         # result.pool is ready to hand to Coordinator
 
@@ -218,6 +231,7 @@ class PoolBuilder:
     __slots__ = (
         "_credentials",
         "_transport",
+        "_settings",
         "_page_limit",
         "_max_pages",
         "_http_timeout",
@@ -228,6 +242,7 @@ class PoolBuilder:
         self,
         credentials: BrainCredentials,
         transport: HttpTransport,
+        settings: BrainSettings | None = None,
         *,
         page_limit: int = 50,
         max_pages: int = 200,
@@ -241,6 +256,7 @@ class PoolBuilder:
             raise ValueError("http_timeout must be > 0")
         self._credentials = credentials
         self._transport = transport
+        self._settings = settings if settings is not None else BrainSettings()
         self._page_limit = page_limit
         self._max_pages = max_pages
         self._http_timeout = http_timeout
@@ -274,9 +290,15 @@ class PoolBuilder:
     # --- fetch ---------------------------------------------------------
 
     def _fetch_paginated(
-        self, endpoint: str
+        self,
+        endpoint: str,
+        extra_params: Mapping[str, str] | None = None,
     ) -> tuple[list[Any], int]:
         """Fetch every page from `endpoint`. Returns (items, pages_fetched).
+
+        `extra_params` are merged into the query string on every page
+        request, alongside `limit` and `offset`. The order is
+        deterministic (sorted keys) so URLs are reproducible.
 
         Loop termination: a page shorter than page_limit marks the end.
         Additionally, if a page equals the previous page byte-for-byte,
@@ -289,11 +311,16 @@ class PoolBuilder:
         pages = 0
         previous_signature: str | None = None
 
+        sorted_extra: list[tuple[str, str]] = []
+        if extra_params:
+            sorted_extra = sorted(extra_params.items())
+
         for _ in range(self._max_pages):
-            url = (
-                f"{endpoint}"
-                f"?limit={self._page_limit}&offset={offset}"
-            )
+            query_parts = [f"{k}={v}" for k, v in sorted_extra]
+            query_parts.append(f"limit={self._page_limit}")
+            query_parts.append(f"offset={offset}")
+            url = f"{endpoint}?{'&'.join(query_parts)}"
+
             try:
                 resp = self._transport.request(
                     "GET", url, timeout=self._http_timeout
@@ -323,9 +350,6 @@ class PoolBuilder:
             items = _extract_items(payload, endpoint)
             pages += 1
 
-            # Detect a repeated page: the server ignored limit/offset
-            # and returned the same payload. The first page IS the whole
-            # result. See D-106.
             signature: str | None
             try:
                 signature = json.dumps(items, sort_keys=True)
@@ -397,8 +421,13 @@ class PoolBuilder:
     def fetch_fields(
         self,
     ) -> tuple[tuple[FieldDef, ...], tuple[str, ...], int]:
-        """Fetch every field. Returns (fields, dropped_ids, pages)."""
-        items, pages = self._fetch_paginated(_DATA_FIELDS_URL)
+        """Fetch every field. Returns (fields, dropped_ids, pages).
+
+        The /data-fields endpoint requires simulation settings as query
+        parameters. See D-107.
+        """
+        extra = _settings_query(self._settings)
+        items, pages = self._fetch_paginated(_DATA_FIELDS_URL, extra)
         kept: list[FieldDef] = []
         dropped: list[str] = []
         for raw in items:
@@ -415,7 +444,10 @@ class PoolBuilder:
         return tuple(kept), tuple(sorted(dropped)), pages
 
     def fetch_operator_names(self) -> tuple[tuple[str, ...], int]:
-        """Fetch every operator name. Returns (names, pages)."""
+        """Fetch every operator name. Returns (names, pages).
+
+        /operators does not require settings. See D-107.
+        """
         items, pages = self._fetch_paginated(_OPERATORS_URL)
         names: list[str] = []
         for raw in items:

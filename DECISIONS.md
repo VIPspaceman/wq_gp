@@ -2507,3 +2507,48 @@ or a new termination hint (e.g. a `Link: rel=next` header) needs to
 be used. Do NOT weaken the check to "only the first two pages".
 
 ---
+
+---
+
+## D-107 — PoolBuilder takes settings; /data-fields needs them
+
+**Decision**: `PoolBuilder.__init__` accepts `settings: BrainSettings |
+None = None`. When None, it uses `BrainSettings()` (USA / TOP3000 /
+delay 1). `fetch_fields()` appends `instrumentType`, `region`, `delay`,
+`universe` to the query string of every `/data-fields` request.
+`fetch_operator_names()` sends none of these.
+
+**Why**: BRAIN's `/data-fields` endpoint returns HTTP 400 with
+`["Invalid query"]` when called without simulation settings. The
+endpoint is not "list all fields"; it is "list fields available in
+this specific simulation configuration". The same field id can exist
+in one region and be absent in another, and the `delay` parameter
+selects a different variant of the dataset.
+
+`/operators` does not have this requirement; the operator list is
+global. Sending settings to it would be harmless (extra query
+parameters are ignored) but we deliberately don't, so the request
+URLs stay minimal and the behavior is testable.
+
+The `settings` parameter is optional so `SignaturesAudit` (which only
+calls `/operators`) does not need to construct one. The default is
+`BrainSettings()` rather than a hard-coded dict because `BrainSettings`
+is already the single source of truth for what the defaults mean, and
+keeping them in one place avoids drift.
+
+The CLI exposes four flags on `build-pool`: `--instrument-type`,
+`--region`, `--universe`, `--delay`. Each defaults to None, and the
+resolver fills in from `BrainSettings()`. This keeps the flag help
+text and the dataclass defaults in sync automatically.
+
+Query parameters are sorted alphabetically before being joined, so
+the URL is deterministic. This makes the request reproducible across
+runs and the tests straightforward to assert against.
+
+**Revisit if**: BRAIN adds a second settings-bearing endpoint. Then
+the settings serialization (`_settings_query`) moves into a shared
+helper, or `BrainSettings` gains a `to_query_dict()` method next to
+its existing `to_api_dict()`. Do NOT duplicate the four-key dict in
+each endpoint's fetch method.
+
+---
