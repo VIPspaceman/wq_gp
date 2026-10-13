@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: wqgp
+Version: 0.0.1
+Summary: WorldQuant BRAIN alpha mining via genetic programming
+Requires-Python: >=3.10
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"

@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/wqgp/__init__.py
+src/wqgp/types.py
+src/wqgp.egg-info/PKG-INFO
+src/wqgp.egg-info/SOURCES.txt
+src/wqgp.egg-info/dependency_links.txt
+src/wqgp.egg-info/requires.txt
+src/wqgp.egg-info/top_level.txt
+tests/test_types.py

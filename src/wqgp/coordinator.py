@@ -1,0 +1,380 @@
+"""End-to-end GP coordinator.
+
+Design decisions:
+- AST/Individual/Population serialization lives in gp_serialization.py.
+  See D-065.
+- Expression rendering lives in ast.py. See D-066.
+- Checkpoints save the UNEVALUATED next-generation population. Resume
+  therefore starts from the evaluation step, matching a from-scratch
+  run exactly. See D-067.
+- Before submitting, existing evaluations are absorbed from the store
+  so elites and resumed individuals are not re-submitted. See D-068.
+- One Executor for the whole run. See D-069.
+- The loop ends on budget exhaustion, zero evaluated individuals, or
+  reaching max_generations. See D-070.
+
+Lifecycle:
+    coord = Coordinator(config, evaluator)
+    result = coord.run()   # single use; construct a new Coordinator to
+                           # run again (the EvaluationStore is closed).
+
+This module does NOT talk to BRAIN. Wire a real BRAIN client as the
+`evaluator` to do that.
+"""
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from pathlib import Path
+
+from wqgp._ids import validate_run_id
+from wqgp.ast import render as render_ast
+from wqgp.budget import Budget, BudgetTracker
+from wqgp.checkpoint import Checkpoint, CheckpointStore
+from wqgp.crossover import Crossover
+from wqgp.execution import Evaluator, Executor, Task
+from wqgp.gp_serialization import (
+    population_from_dict,
+    population_to_dict,
+)
+from wqgp.mutation import Mutator
+from wqgp.persistence import EvaluationStatus, EvaluationStore
+from wqgp.pool import Pool
+from wqgp.population import (
+    GenerationError,
+    Individual,
+    Population,
+    RandomAstBuilder,
+)
+from wqgp.selection import SelectionConfig, next_generation
+from wqgp.types import DataType
+
+
+class CoordinatorError(RuntimeError):
+    """Raised on unrecoverable coordinator failures."""
+
+
+@dataclass(frozen=True, slots=True)
+class RunConfig:
+    """Frozen, validated configuration for one GP run.
+
+    Invariants (enforced in __post_init__):
+      - run_id passes _ids.validate_run_id
+      - max_generations >= 1
+      - n_workers >= 1
+      - initial_population_size is None or >= 1
+      - builder_max_depth >= 0, builder_max_nodes >= 1
+      - crossover_max_depth >= 1, crossover_max_nodes >= 1
+    """
+    run_id: str
+    pool: Pool
+    budget: Budget
+    selection: SelectionConfig
+    seed: int
+    max_generations: int = 10
+    checkpoint_root: Path = Path("./checkpoints")
+    evaluation_db: Path | None = None
+    n_workers: int = 4
+    initial_population_size: int | None = None
+    builder_max_depth: int = 4
+    builder_max_nodes: int = 25
+    crossover_max_depth: int = 6
+    crossover_max_nodes: int = 40
+
+    def __post_init__(self) -> None:
+        validate_run_id(self.run_id)
+        if self.max_generations < 1:
+            raise ValueError("max_generations must be >= 1")
+        if self.n_workers < 1:
+            raise ValueError("n_workers must be >= 1")
+        if (
+            self.initial_population_size is not None
+            and self.initial_population_size < 1
+        ):
+            raise ValueError(
+                "initial_population_size must be >= 1 if set"
+            )
+        if self.builder_max_depth < 0:
+            raise ValueError("builder_max_depth must be >= 0")
+        if self.builder_max_nodes < 1:
+            raise ValueError("builder_max_nodes must be >= 1")
+        if self.crossover_max_depth < 1:
+            raise ValueError("crossover_max_depth must be >= 1")
+        if self.crossover_max_nodes < 1:
+            raise ValueError("crossover_max_nodes must be >= 1")
+
+
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    """Outcome of a completed run."""
+    generation: int
+    population: Population
+    total_simulations_used: int
+    budget_exhausted: bool
+    stopped_reason: str
+
+
+class Coordinator:
+    """Drives the GP loop end to end.
+
+    Owns the EvaluationStore, CheckpointStore, Mutator, and Crossover.
+    Creates one Executor per `run()` call.
+    """
+
+    __slots__ = (
+        "_config",
+        "_evaluator",
+        "_store",
+        "_ckpt_store",
+        "_mutator",
+        "_crossover",
+    )
+
+    def __init__(self, config: RunConfig, evaluator: Evaluator) -> None:
+        self._config = config
+        self._evaluator = evaluator
+
+        # Resolve the evaluation DB path.
+        if config.evaluation_db is not None:
+            db_path = Path(config.evaluation_db)
+        else:
+            db_path = Path(config.checkpoint_root) / f"{config.run_id}.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._store = EvaluationStore(db_path)
+
+        self._ckpt_store = CheckpointStore(config.checkpoint_root)
+        self._mutator = Mutator(config.pool)
+        self._crossover = Crossover(
+            config.pool,
+            max_depth=config.crossover_max_depth,
+            max_nodes=config.crossover_max_nodes,
+        )
+
+    # --- public ---------------------------------------------------------
+
+    def run(self) -> RunResult:
+        pop, tracker, rng, start_gen = self._setup()
+
+        executor = Executor(
+            run_id=self._config.run_id,
+            store=self._store,
+            evaluator=self._evaluator,
+            tracker=tracker,
+            n_workers=self._config.n_workers,
+        )
+        executor.start()
+
+        stopped_reason = "max_generations"
+        budget_exhausted = False
+        last_generation = start_gen
+
+        try:
+            generation = start_gen
+            while generation < self._config.max_generations:
+                tracker.start_generation()
+                last_generation = generation
+
+                # 1. Absorb any existing evaluations (elites, resume).
+                pop = self._merge_evaluations(pop)
+
+                # 2. Submit the unevaluated individuals.
+                self._evaluate(executor, pop, tracker)
+
+                # 3. Absorb the fresh evaluations.
+                pop = self._merge_evaluations(pop)
+
+                # 4. Termination checks.
+                if tracker.is_exhausted():
+                    stopped_reason = "budget_exhausted"
+                    budget_exhausted = True
+                    break
+                if len(pop.evaluated()) == 0:
+                    stopped_reason = "no_progress"
+                    break
+                if generation + 1 >= self._config.max_generations:
+                    break
+
+                # 5. Generate the next generation and checkpoint it.
+                pop = next_generation(
+                    pop,
+                    self._mutator,
+                    self._crossover,
+                    self._config.selection,
+                    rng,
+                )
+                generation += 1
+                self._save_checkpoint(pop, tracker, rng, generation)
+        finally:
+            executor.shutdown()
+            self._store.close()
+
+        return RunResult(
+            generation=last_generation,
+            population=pop,
+            total_simulations_used=tracker.total_simulations_used,
+            budget_exhausted=budget_exhausted,
+            stopped_reason=stopped_reason,
+        )
+
+    # --- setup ----------------------------------------------------------
+
+    def _setup(
+        self,
+    ) -> tuple[Population, BudgetTracker, random.Random, int]:
+        existing = self._ckpt_store.load_latest(self._config.run_id)
+        if existing is None:
+            return self._initial_setup()
+        return self._resume_setup(existing)
+
+    def _initial_setup(
+        self,
+    ) -> tuple[Population, BudgetTracker, random.Random, int]:
+        rng = random.Random(self._config.seed)
+        tracker = BudgetTracker(self._config.budget)
+
+        size = (
+            self._config.initial_population_size
+            if self._config.initial_population_size is not None
+            else self._config.selection.population_size
+        )
+        builder = RandomAstBuilder(
+            self._config.pool,
+            max_depth=self._config.builder_max_depth,
+            max_nodes=self._config.builder_max_nodes,
+        )
+
+        individuals: list[Individual] = []
+        seen_fps: set[str] = set()
+        attempts = 0
+        max_attempts = size * 20
+        while len(individuals) < size and attempts < max_attempts:
+            attempts += 1
+            try:
+                ast = builder.build(DataType.MATRIX, rng)
+            except GenerationError:
+                continue
+            fp = ast.fingerprint()
+            if fp in seen_fps:
+                continue
+            seen_fps.add(fp)
+            individuals.append(Individual.from_ast(ast, generation=0))
+
+        if not individuals:
+            raise CoordinatorError(
+                f"could not generate any initial individuals "
+                f"after {max_attempts} attempts"
+            )
+
+        pop = Population(individuals)
+        self._save_checkpoint(pop, tracker, rng, generation=0)
+        return pop, tracker, rng, 0
+
+    def _resume_setup(
+        self, ckpt: Checkpoint
+    ) -> tuple[Population, BudgetTracker, random.Random, int]:
+        pop = self._load_population_from_checkpoint(ckpt)
+
+        snap = ckpt.budget
+        tracker = BudgetTracker(
+            self._config.budget,
+            elapsed_offset_seconds=snap.elapsed_seconds,
+            total_simulations_used=snap.total_simulations_used,
+            generation_simulations_used=0,
+        )
+        rng = ckpt.restore_rng()
+        start_gen = ckpt.generation
+        return pop, tracker, rng, start_gen
+
+    def _load_population_from_checkpoint(
+        self, ckpt: Checkpoint
+    ) -> Population:
+        raw = ckpt.payload.get("population")
+        if raw is None:
+            raise CoordinatorError(
+                f"checkpoint {ckpt.generation} has no 'population' payload"
+            )
+        try:
+            return population_from_dict(
+                raw,
+                field_lookup=self._config.pool.fields.by_id,
+                operator_lookup=self._config.pool.operators.by_name,
+            )
+        except Exception as e:
+            raise CoordinatorError(
+                f"failed to load population from checkpoint "
+                f"{ckpt.generation}: {e}"
+            ) from e
+
+    # --- evaluation -----------------------------------------------------
+
+    def _evaluate(
+        self,
+        executor: Executor,
+        pop: Population,
+        tracker: BudgetTracker,
+    ) -> int:
+        """Submit every unevaluated, non-failed individual. Waits for
+        drain if any submission succeeded. Returns the submission count."""
+        submitted = 0
+        for ind in pop:
+            if ind.is_evaluated():
+                continue
+            if ind.status is EvaluationStatus.FAILED:
+                # Already failed in a previous generation or run; do not
+                # retry within this run.
+                continue
+            task = Task(
+                fingerprint=ind.fingerprint,
+                expression=render_ast(ind.ast),
+                generation=ind.generation,
+            )
+            if not executor.submit(task):
+                break  # budget exhausted mid-generation
+            submitted += 1
+
+        if submitted > 0:
+            executor.run_until_drained()
+        return submitted
+
+    def _merge_evaluations(self, pop: Population) -> Population:
+        """Return a new Population where any individual present in the
+        evaluation store has been given its fitness and metrics."""
+        updated: list[Individual] = []
+        for ind in pop:
+            if ind.is_evaluated():
+                updated.append(ind)
+                continue
+            if ind.status is EvaluationStatus.FAILED:
+                updated.append(ind)
+                continue
+            rec = self._store.get(self._config.run_id, ind.fingerprint)
+            if rec is None or rec.status is not EvaluationStatus.SUCCESS:
+                updated.append(ind)
+                continue
+            updated.append(
+                ind.with_evaluation(
+                    fitness=rec.fitness,  # type: ignore[arg-type]
+                    metrics=rec.metrics,
+                )
+            )
+        return Population(updated)
+
+    # --- checkpoint -----------------------------------------------------
+
+    def _save_checkpoint(
+        self,
+        pop: Population,
+        tracker: BudgetTracker,
+        rng: random.Random,
+        generation: int,
+    ) -> None:
+        payload = {"population": population_to_dict(pop)}
+        ckpt = Checkpoint.capture(
+            run_id=self._config.run_id,
+            generation=generation,
+            budget=tracker.snapshot(),
+            rng=rng,
+            payload=payload,
+            note=f"start of generation {generation}",
+        )
+        self._ckpt_store.save(ckpt)
