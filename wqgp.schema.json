@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/VIPspaceman/wq_gp/wqgp.schema.json",
+  "title": "wqgp configuration",
+  "description": "Settings for a wqgp run. Credentials are optional; environment variables take precedence when set.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "$schema": { "type": "string" },
+    "credentials": {
+      "type": "object",
+      "description": "BRAIN login. Only used if WQ_BRAIN_USERNAME / WQ_BRAIN_PASSWORD are not set. Keep this file chmod 600 and out of git.",
+      "additionalProperties": false,
+      "properties": {
+        "username": { "type": "string", "minLength": 1 },
+        "password": { "type": "string", "minLength": 1 }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "OFF"],
+          "description": "Root logger level. Channels override this per component."
+        },
+        "style": {
+          "type": "string",
+          "enum": ["default", "compact", "minimal"]
+        },
+        "file": {
+          "type": ["string", "null"],
+          "description": "Optional log file. Same records as stderr."
+        },
+        "channels": {
+          "type": "object",
+          "description": "Per-component log level. Short names ('brain') map to 'wqgp.brain'.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "OFF"]
+          }
+        }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "instrument_type": { "type": "string" },
+        "region": { "type": "string" },
+        "universe": { "type": "string" },
+        "delay": { "type": "integer", "minimum": 0 },
+        "decay": { "type": "integer", "minimum": 0 },
+        "neutralization": { "type": "string" },
+        "n_workers": { "type": "integer", "minimum": 1 },
+        "max_concurrent": { "type": "integer", "minimum": 1 },
+        "seed": { "type": "integer" },
+        "max_generations": { "type": "integer", "minimum": 1 },
+        "population_size": { "type": "integer", "minimum": 1 },
+        "elite_count": { "type": "integer", "minimum": 0 },
+        "tournament_size": { "type": "integer", "minimum": 1 },
+        "crossover_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_breeding_attempts": { "type": "integer", "minimum": 1 },
+        "checkpoint_root": { "type": "string" }
+      }
+    }
+  }
+}

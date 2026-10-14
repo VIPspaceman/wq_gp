@@ -3450,3 +3450,116 @@ did it finish"; the page-by-page detail belongs at DEBUG.
 concern; split when that stops being true.
 
 ---
+
+---
+
+## D-135 — Config-file credentials allowed, env vars still win
+
+**Decision**: `Settings` gains a `credentials` block. `cli._resolve_credentials`
+prefers `WQ_BRAIN_USERNAME` / `WQ_BRAIN_PASSWORD` when set; if not,
+falls back to the config file; if neither, raises `CliError`. When
+credentials come from the file, the CLI logs a WARNING once per run,
+and `_load_settings` also checks the file's mode and logs a second
+WARNING if group/other read bits are set.
+
+**Why**: this partially reverses D-089, which said secrets come only
+from environment variables. The user explicitly asked for
+config-file credentials to make overnight runs easier — restarting a
+long run should not require re-exporting two env vars in a fresh
+shell.
+
+The safety story has three layers:
+
+1. Env vars still win. A user who switches back to env vars without
+   editing the config is protected; nothing needs to change in the
+   file.
+2. A mode check. On POSIX systems, a file readable by other users
+   (mode has any of 0o077 set) triggers a WARNING telling the user to
+   `chmod 600`. This does not block the run; it is a loud nudge.
+3. A run-time WARNING when credentials actually come from the file, so
+   the user sees the source of truth on every run start.
+
+The `credentials` block is validated strictly. A typo like `"user"`
+instead of `"username"` is rejected with a clear error rather than
+silently leading to a login failure with a puzzling HTTP 401.
+
+`.gitignore` gains `wqgp.json` in the project root. The README is
+updated to say so.
+
+**Revisit if**: we need to support secrets from a vault or a
+credential helper (`pass`, `gpg`, AWS Secrets Manager). Then add a
+`credentials_command` field that names a command whose stdout is
+parsed as JSON. Still never accept a password on the command line
+itself.
+
+---
+
+## D-136 — Split `--config` into `--settings` and `--run-config`
+
+**Decision**: `run` accepts three flags:
+
+- `--settings PATH` — reads `logging`, `defaults`, `credentials`
+- `--run-config PATH` — reads `run_id`, `pool_path`, `budget`,
+  `selection`, etc.
+- `--config PATH` — backward-compatible alias; its file is read by
+  both loaders.
+
+When both `--settings` and `--config` are present, `--settings` wins
+for the settings blocks. Same for `--run-config` and `--config`.
+
+New flags to fill gaps the config used to cover awkwardly:
+
+- `--log-file PATH` overrides `logging.file` per invocation.
+- `--max-concurrent N` sets `BrainClient`'s concurrency cap. Default
+  comes from `settings.defaults.max_concurrent`.
+
+**Why**: a single `--config` was doing two jobs with different
+lifetimes. The `logging` / `defaults` / `credentials` blocks are
+global — they rarely change and belong to the user's environment. The
+`run_id` / `pool_path` / `budget` / `selection` keys are per-run —
+they change every experiment. Coupling them into one file means every
+new experiment edits a file that also holds the user's credentials,
+which is a bad place to make frequent edits.
+
+Backward compatibility is preserved because existing config files
+work unchanged: `--config` still reads both blocks. Users who care
+about the separation opt in by writing two files.
+
+The `--log-file` and `--max-concurrent` flags exist because both
+settings are commonly overridden per-run — "this run to a different
+log file", "this run with more concurrency" — and requiring a file
+edit for a one-off is friction.
+
+**Revisit if**: a third class of settings appears with a different
+lifetime (e.g. a "profile" that groups pool + budget). Then it
+becomes another flag with its own loader. Do NOT collapse everything
+back into `--config` to reduce the flag count; the current split
+reflects a real lifetime difference.
+
+---
+
+## D-137 — `wqgp.json` ships with a JSON Schema
+
+**Decision**: the project root gains `wqgp.schema.json` and the
+example `wqgp.json` starts with `"$schema": "./wqgp.schema.json"`.
+The schema describes every recognized block and field.
+
+**Why**: the config has grown to three blocks and a dozen fields.
+Without a schema, a user editing `wqgp.json` in an editor has no
+autocompletion, no hover docs, and no inline error for a typo until
+the CLI rejects the file at startup. A schema gives all three in any
+editor that understands JSON Schema (VSCode, PyCharm, IntelliJ,
+Vim with an LSP).
+
+The schema marks `additionalProperties: false` on the inner blocks
+(`credentials`, `logging`, `defaults`) to match the strict parsing in
+`Settings.from_dict`. The top level is `additionalProperties: true`
+because it must accept the run-config keys the CLI's own loader
+reads (see D-121).
+
+**Revisit if**: we add a TOML or YAML loader for users who prefer
+comments in their config. Then a schema per format. Do NOT convert
+the JSON schema to a "best-effort" checker; the whole point is that
+editors enforce it exactly.
+
+---

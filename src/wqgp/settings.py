@@ -1,15 +1,15 @@
 """Project-wide settings loaded from a single JSON file.
 
 Design decisions:
-- One file, two blocks: `logging` and `defaults`. See D-117.
+- One file, three blocks: `credentials`, `logging`, `defaults`.
+  See D-117 and D-135.
 - CLI flags override the file's defaults; the file overrides code
-  defaults. Same precedence rule as D-088, applied to the new blocks.
-- The `defaults` block only carries values that are commonly the same
-  across runs. `run_id` and `pool_path` deliberately do NOT have
-  defaults; they must be supplied per run.
+  defaults. Same precedence rule as D-088.
 - Unknown top-level keys are IGNORED so the same file can carry
   run-config keys for the CLI's own loader. Unknown keys inside the
-  `logging` and `defaults` blocks are still rejected. See D-121.
+  recognized blocks are still rejected. See D-121.
+- Credentials in the config file are supported but env vars take
+  precedence. See D-135.
 """
 from __future__ import annotations
 
@@ -21,14 +21,49 @@ from typing import Any, Mapping
 from wqgp.logging_setup import LoggingSettings
 
 
+# --- credentials ------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class CredentialsSettings:
+    """BRAIN login read from the config file.
+
+    Both fields are optional. `is_complete()` returns True only when
+    both are set, so a half-filled block is treated as absent rather
+    than as a partial credential. See D-135.
+    """
+    username: str | None = None
+    password: str | None = None
+
+    def is_complete(self) -> bool:
+        return bool(self.username and self.password)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CredentialsSettings":
+        if not isinstance(data, dict):
+            raise ValueError("credentials block must be an object")
+        known = {"username", "password"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(
+                f"unknown credentials keys: {sorted(unknown)}"
+            )
+        username = data.get("username")
+        password = data.get("password")
+        if username is not None and not isinstance(username, str):
+            raise ValueError("credentials.username must be a string")
+        if password is not None and not isinstance(password, str):
+            raise ValueError("credentials.password must be a string")
+        return cls(username=username, password=password)
+
+
 # --- defaults ---------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
 class DefaultsSettings:
     """Default values for run parameters.
 
-    These are consulted only when the corresponding CLI flag is not
-    given and the run-level config does not supply the value.
+    Consulted only when the corresponding CLI flag is not given and
+    the run-level config does not supply the value.
     """
     # BRAIN simulation settings.
     instrument_type: str = "EQUITY"
@@ -82,15 +117,15 @@ class Settings:
     """Aggregate of the blocks we recognize in the config file.
 
     Unknown top-level keys are ignored, so a file that also carries
-    `run_id` / `pool_path` / `budget` (read by the CLI's own loader)
-    is accepted. The `logging` and `defaults` blocks, if present, are
-    validated strictly. See D-121.
-
-    `raw` preserves the original dict so future blocks can be read by
-    consumers without a schema change here.
+    `run_id` / `pool_path` / `budget` (read by the CLI's run-config
+    loader) is accepted. Recognized blocks are validated strictly.
+    See D-121.
     """
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     defaults: DefaultsSettings = field(default_factory=DefaultsSettings)
+    credentials: CredentialsSettings = field(
+        default_factory=CredentialsSettings
+    )
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -104,16 +139,17 @@ class Settings:
 
         logging_block = data.get("logging", {})
         defaults_block = data.get("defaults", {})
+        credentials_block = data.get("credentials", {})
 
         return cls(
             logging=LoggingSettings.from_dict(logging_block),
             defaults=DefaultsSettings.from_dict(defaults_block),
+            credentials=CredentialsSettings.from_dict(credentials_block),
             raw=dict(data),
         )
 
     @classmethod
     def load(cls, path: Path | str | None) -> "Settings":
-        """Load settings from `path`. A None path returns the defaults."""
         if path is None:
             return cls.default()
         p = Path(path)
@@ -127,3 +163,20 @@ class Settings:
                 f"settings file {p} is not valid JSON: {e}"
             ) from e
         return cls.from_dict(data)
+
+
+# --- helpers ----------------------------------------------------------------
+
+def is_insecure_credentials_file(path: Path) -> bool:
+    """True iff the file is readable by anyone other than its owner.
+
+    On POSIX systems this checks the group/other read bits. On Windows
+    the mode is a stub, and the check returns False. See D-135.
+    """
+    if not path.exists():
+        return False
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return False
+    return bool(mode & 0o077)

@@ -3,7 +3,8 @@
 Design decisions:
 - Subparsers via argparse. See D-087.
 - Config is JSON, flag > config > default. See D-088.
-- Secrets come ONLY from environment variables. See D-089.
+- Credentials: env vars take precedence over the config file.
+  See D-089 and D-135.
 - SIGINT propagates; exit code 130. See D-090.
 - Structured logging to stderr; --log-level controls verbosity. See
   D-091.
@@ -12,6 +13,9 @@ Design decisions:
 - `signatures` audits a signature table; never writes it. See D-102.
 - `build-pool` accepts simulation settings flags. See D-107.
 - Logs go to the "wqgp.cli" channel. See D-134.
+- `--settings` and `--run-config` split the two loader roles.
+  `--config` remains as a backward-compatible alias for both.
+  See D-136.
 """
 from __future__ import annotations
 
@@ -52,7 +56,10 @@ from wqgp.notification.telegram import (
 from wqgp.pool import Pool, PoolError
 from wqgp.selection import SelectionConfig
 from wqgp.serialization import SerializationError
-from wqgp.settings import Settings
+from wqgp.settings import (
+    Settings,
+    is_insecure_credentials_file,
+)
 from wqgp.signatures_audit import (
     SignatureAudit,
     audit_signatures,
@@ -82,16 +89,37 @@ class CliError(RuntimeError):
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
-def _load_settings(args: argparse.Namespace) -> Settings:
-    """Load the settings file, if --config was given.
+def _resolve_settings_path(args: argparse.Namespace) -> Path | None:
+    """Pick the settings file path from flags.
 
-    --config is defined only on the `run` subcommand. See D-120.
+    `--settings` wins if given. Otherwise `--config` is used for
+    backward compatibility. If neither is set, returns None.
     """
+    settings_path = getattr(args, "settings", None)
+    if settings_path:
+        return Path(settings_path)
     config_path = getattr(args, "config", None)
+    if config_path:
+        return Path(config_path)
+    return None
+
+
+def _load_settings(args: argparse.Namespace) -> Settings:
+    """Load the settings file, if given. Apply --log-level override."""
+    path = _resolve_settings_path(args)
     try:
-        settings = Settings.load(config_path)
+        settings = Settings.load(path)
     except (FileNotFoundError, ValueError) as e:
         raise CliError(str(e)) from e
+
+    if path is not None and settings.credentials.is_complete():
+        if is_insecure_credentials_file(path):
+            log.warning(
+                "credentials are stored in %s, which is readable by "
+                "other users on this machine (mode=%o). Run "
+                "'chmod 600 %s' to restrict access.",
+                path, path.stat().st_mode & 0o777, path,
+            )
 
     log_level = getattr(args, "log_level", None)
     if log_level is not None:
@@ -103,9 +131,56 @@ def _load_settings(args: argparse.Namespace) -> Settings:
                 file=settings.logging.file,
             ),
             defaults=settings.defaults,
+            credentials=settings.credentials,
             raw=settings.raw,
         )
+
+    log_file = getattr(args, "log_file", None)
+    if log_file is not None:
+        settings = Settings(
+            logging=LoggingSettings(
+                level=settings.logging.level,
+                style=settings.logging.style,
+                channels=settings.logging.channels,
+                file=str(log_file),
+            ),
+            defaults=settings.defaults,
+            credentials=settings.credentials,
+            raw=settings.raw,
+        )
+
     return settings
+
+
+def _resolve_credentials(settings: Settings) -> BrainCredentials:
+    """Resolve BRAIN credentials.
+
+    Precedence: env vars > config file > error. Env vars win because
+    they are the safer channel; a user who sets both is presumed to
+    want the env value to apply. See D-089 and D-135.
+    """
+    try:
+        return BrainCredentials.from_env()
+    except BrainAuthError:
+        pass
+
+    if settings.credentials.is_complete():
+        log.warning(
+            "using credentials from the config file; environment "
+            "variables WQ_BRAIN_USERNAME / WQ_BRAIN_PASSWORD would "
+            "take precedence if set. Keep the file chmod 600 and "
+            "out of git."
+        )
+        return BrainCredentials(
+            username=settings.credentials.username,  # type: ignore[arg-type]
+            password=settings.credentials.password,  # type: ignore[arg-type]
+        )
+
+    raise CliError(
+        "no BRAIN credentials: set WQ_BRAIN_USERNAME / "
+        "WQ_BRAIN_PASSWORD, or add a 'credentials' block to the "
+        "settings file (see wqgp.schema.json)."
+    )
 
 
 # --- transport factory (patched in tests) -----------------------------------
@@ -130,6 +205,21 @@ def _load_config(path: Path | None) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise CliError(f"config root must be an object: {path}")
     return data
+
+
+def _resolve_run_config_path(args: argparse.Namespace) -> Path | None:
+    """Pick the run-config file path from flags.
+
+    `--run-config` wins if given. Otherwise `--config` is used for
+    backward compatibility.
+    """
+    run_config = getattr(args, "run_config", None)
+    if run_config:
+        return Path(run_config)
+    config_path = getattr(args, "config", None)
+    if config_path:
+        return Path(config_path)
+    return None
 
 
 def _pick(
@@ -161,15 +251,28 @@ def _require(
 
 
 def _settings_from_args(args: argparse.Namespace) -> BrainSettings:
+    """Build a BrainSettings from CLI flags + settings defaults."""
     defaults = BrainSettings()
+    settings_defaults = args._settings.defaults
     return BrainSettings(
         instrument_type=getattr(args, "instrument_type", None)
+        or settings_defaults.instrument_type
         or defaults.instrument_type,
-        region=getattr(args, "region", None) or defaults.region,
-        universe=getattr(args, "universe", None) or defaults.universe,
-        delay=getattr(args, "delay", None)
-        if getattr(args, "delay", None) is not None
-        else defaults.delay,
+        region=getattr(args, "region", None)
+        or settings_defaults.region
+        or defaults.region,
+        universe=getattr(args, "universe", None)
+        or settings_defaults.universe
+        or defaults.universe,
+        delay=(
+            getattr(args, "delay", None)
+            if getattr(args, "delay", None) is not None
+            else (
+                settings_defaults.delay
+                if settings_defaults.delay is not None
+                else defaults.delay
+            )
+        ),
     )
 
 
@@ -200,6 +303,34 @@ def _add_settings_flags(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_path_flags(p: argparse.ArgumentParser) -> None:
+    """Flags for splitting settings from run config."""
+    p.add_argument(
+        "--settings",
+        default=None,
+        help=(
+            "path to the settings file (logging / defaults / "
+            "credentials). Overrides --config for those blocks."
+        ),
+    )
+    p.add_argument(
+        "--run-config",
+        default=None,
+        help=(
+            "path to the run config file (run_id / pool_path / "
+            "budget / selection). Overrides --config for those keys."
+        ),
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "combined config file (settings + run config). "
+            "Backward-compatible alias for --settings + --run-config."
+        ),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -210,6 +341,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "override the config file's logging.level "
             "(default: value from config, or INFO)"
         ),
+    )
+    common.add_argument(
+        "--log-file",
+        default=None,
+        help="override the config file's logging.file",
     )
 
     parser = argparse.ArgumentParser(
@@ -252,6 +388,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-retries-on-429", type=int, default=3,
         help="how many times to retry a rate-limited request (default: 3)",
     )
+    p_bp.add_argument(
+        "--settings", default=None,
+        help="path to the settings file (logging / defaults / credentials)",
+    )
+    p_bp.add_argument(
+        "--config", default=None,
+        help="alias for --settings",
+    )
     _add_settings_flags(p_bp)
     p_bp.set_defaults(handler=_cmd_build_pool)
 
@@ -260,7 +404,7 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="run (or resume) a GP experiment",
     )
-    p_run.add_argument("--config", default=None, help="JSON config file")
+    _add_path_flags(p_run)
     p_run.add_argument("--pool", default=None, help="pool JSON path")
     p_run.add_argument("--run-id", default=None, help="experiment id")
     p_run.add_argument("--total-simulations", type=int, default=None)
@@ -285,6 +429,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--checkpoint-root", default=None)
     p_run.add_argument("--evaluation-db", default=None)
     p_run.add_argument("--n-workers", type=int, default=None)
+    p_run.add_argument(
+        "--max-concurrent", type=int, default=None,
+        help=(
+            "maximum concurrent BRAIN simulations. "
+            "Default from settings.defaults.max_concurrent, or 2."
+        ),
+    )
     p_run.add_argument("--initial-population-size", type=int, default=None)
     p_run.add_argument(
         "--dry-run", action="store_true",
@@ -316,6 +467,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--strict", action="store_true",
         help="exit non-zero if the table is missing operators",
     )
+    p_sig.add_argument(
+        "--settings", default=None,
+        help="path to the settings file",
+    )
+    p_sig.add_argument(
+        "--config", default=None,
+        help="alias for --settings",
+    )
     p_sig.set_defaults(handler=_cmd_signatures)
 
     p_lr = sub.add_parser(
@@ -346,14 +505,45 @@ def _dry_run_evaluator(task: Task) -> TaskResult:
     )
 
 
-def _make_evaluator(args: argparse.Namespace) -> Evaluator:
+def _make_evaluator(
+    args: argparse.Namespace,
+    settings: Settings,
+) -> Evaluator:
     if args.dry_run:
         log.warning("dry-run mode: BRAIN will not be contacted")
         return _dry_run_evaluator
     try:
-        return build_default_client()
+        creds = _resolve_credentials(settings)
     except BrainAuthError as e:
         raise CliError(str(e)) from e
+
+    max_concurrent = getattr(args, "max_concurrent", None)
+    if max_concurrent is None:
+        max_concurrent = settings.defaults.max_concurrent
+
+    brain_settings = _settings_from_args(args)
+    return _build_client_with_creds(
+        creds, brain_settings, max_concurrent,
+    )
+
+
+def _build_client_with_creds(
+    creds: BrainCredentials,
+    settings: BrainSettings,
+    max_concurrent: int,
+):
+    """Construct a BrainClient from explicit credentials.
+
+    Mirrors build_default_client but accepts pre-resolved credentials
+    so that config-file credentials flow through. See D-135.
+    """
+    from wqgp.brain.client import BrainClient
+    return BrainClient(
+        credentials=creds,
+        settings=settings,
+        transport=RequestsTransport(),
+        max_concurrent=max_concurrent,
+    )
 
 
 def _make_notifier(args: argparse.Namespace) -> Notifier:
@@ -377,7 +567,7 @@ def _cmd_build_pool(args: argparse.Namespace) -> int:
         raise CliError(f"cannot load signature table: {e}") from e
 
     try:
-        creds = BrainCredentials.from_env()
+        creds = _resolve_credentials(args._settings)
     except BrainAuthError as e:
         raise CliError(str(e)) from e
 
@@ -449,6 +639,7 @@ def _resolve_selection(
     if not isinstance(s, dict):
         raise CliError("config 'selection' must be an object")
 
+    defaults = args._settings.defaults
     mode = _pick(args, s, "mode", "mode", "single")
 
     raw_objectives = s.get("pareto_objectives", ())
@@ -467,21 +658,33 @@ def _resolve_selection(
 
     return SelectionConfig(
         population_size=int(
-            _pick(args, s, "population_size", "population_size", 20)
+            _pick(
+                args, s, "population_size", "population_size",
+                defaults.population_size,
+            )
         ),
         elite_count=int(
-            _pick(args, s, "elite_count", "elite_count", 2)
+            _pick(
+                args, s, "elite_count", "elite_count",
+                defaults.elite_count,
+            )
         ),
         tournament_size=int(
-            _pick(args, s, "tournament_size", "tournament_size", 3)
+            _pick(
+                args, s, "tournament_size", "tournament_size",
+                defaults.tournament_size,
+            )
         ),
         crossover_rate=float(
-            _pick(args, s, "crossover_rate", "crossover_rate", 0.7)
+            _pick(
+                args, s, "crossover_rate", "crossover_rate",
+                defaults.crossover_rate,
+            )
         ),
         max_breeding_attempts=int(
             _pick(
                 args, s, "max_breeding_attempts",
-                "max_breeding_attempts", 200,
+                "max_breeding_attempts", defaults.max_breeding_attempts,
             )
         ),
         mode=str(mode),
@@ -490,8 +693,9 @@ def _resolve_selection(
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    cfg = _load_config(Path(args.config) if args.config else None)
-    defaults = args._settings.defaults
+    cfg = _load_config(_resolve_run_config_path(args))
+    settings = args._settings
+    defaults = settings.defaults
 
     pool_raw = _pick(args, cfg, "pool", "pool_path", None)
     if pool_raw is None:
@@ -554,7 +758,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.info("starting new run %s", run_cfg.run_id)
 
-    evaluator = _make_evaluator(args)
+    evaluator = _make_evaluator(args, settings)
     notifier = _make_notifier(args)
 
     try:
@@ -578,7 +782,7 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
         raise CliError(f"cannot load signature table: {e}") from e
 
     try:
-        creds = BrainCredentials.from_env()
+        creds = _resolve_credentials(args._settings)
     except BrainAuthError as e:
         raise CliError(str(e)) from e
 

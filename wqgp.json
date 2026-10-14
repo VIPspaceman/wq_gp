@@ -1,4 +1,11 @@
 {
+  "$schema": "./wqgp.schema.json",
+
+  "credentials": {
+    "username": "vip.spaceman@gmail.com",
+    "password": "k$xLDJqH_GM9C4h"
+  },
+
   "logging": {
     "level": "INFO",
     "style": "default",
@@ -13,10 +20,13 @@
       "cli": "INFO"
     }
   },
+
   "defaults": {
     "region": "USA",
     "universe": "TOP3000",
     "delay": 1,
+    "decay": 4,
+    "neutralization": "INDUSTRY",
     "n_workers": 4,
     "max_concurrent": 2,
     "seed": 42,
