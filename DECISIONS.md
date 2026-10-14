@@ -3771,3 +3771,257 @@ existing cache. Neither is hard, but neither is necessary either.
 **Revisit if**: single-process runs turn out to be the only mode we
 ever use. Then the columns can be dropped in a later schema version
 bump. Until then, dead columns are cheaper than a migration.
+
+---
+
+## D-145 — One failure classifier, shared by Coordinator and import script
+
+**Decision**: `classify_failure(error) -> ErrorType | None` lives in
+`cache.py` and is imported by both the live Coordinator (when writing
+fresh failures) and `scripts/import_runs_to_cache.py` (when migrating
+historical runs). The pattern list `_PERMANENT_PATTERNS` lives next to
+it.
+
+**Why**: the classifier is the one place that decides "this failure is
+permanent; caching it is safe". If the import script had its own copy,
+a fix in one list would silently miss the other, and the two paths
+would drift apart in their notion of what "permanent" means. Two
+classifiers that disagree about a failure class are worse than no
+classifier: one path caches a transient failure, the other does not,
+and the cache's contents depend on which entry point wrote a row.
+
+The list of patterns is intentionally short and conservative. Adding
+a pattern is a promise that the error will never resolve by retrying
+the same expression under the same settings. When in doubt, leave it
+out; an uncached failure costs one extra simulation, a wrongly cached
+one costs a permanently skipped good expression.
+
+**Revisit if**: BRAIN adds error codes or a structured error field to
+its responses. Then the classifier should match on the code, not on a
+substring of a human-readable message. Do not build a dictionary of
+message variants before that field exists.
+
+---
+
+## D-146 — Cache integrates via Coordinator, not via Executor
+
+**Decision**: cache reads happen in `Coordinator._evaluate` (before
+submission) and cache writes happen in `Coordinator._merge_evaluations`
+(after evaluation, when results are already in the run DB). The
+`Executor` and `BrainClient` remain cache-unaware.
+
+**Why**: the Executor is a generic thread-pool that knows only about
+Tasks and TaskResults. Threading a cache through it would couple a
+general-purpose component to a specific storage optimization. The
+BrainClient is a thin HTTP client; giving it write-through cache
+semantics would make its behavior depend on a second SQLite file and
+make it harder to reason about from the outside.
+
+The Coordinator is the natural seam. It already owns the run DB, the
+population, and the simulation budget. It reads from the run DB when
+merging evaluations; writing to the cache in the same pass costs
+nothing extra and keeps the cache and run DB views consistent
+(they're updated in the same call).
+
+Cache hits write a full `EvaluationRecord` into the run DB — the same
+record that a fresh evaluation would produce, just with the metrics
+copied from the cache. This is required by D-068's invariant: the
+Coordinator's `_merge_evaluations` must find a result for every
+submitted fingerprint, or it will treat the individual as pending and
+resubmit it. A cache hit that only incremented a counter and did not
+write to the run DB would break that invariant.
+
+Cache hits do NOT count against the simulation budget. The budget
+tracks BRAIN-side resource consumption; a hit consumes none.
+
+**Revisit if**: a second consumer of the cache appears that is not the
+Coordinator (e.g. a "replay this expression" CLI). Then that consumer
+gets its own lookup helper. Do NOT move the cache into the Executor to
+share code; the coupling costs more than the duplication.
+
+---
+
+## D-147 — --no-cache disables both reads and writes
+
+**Decision**: `wqgp run --no-cache` constructs the Coordinator with
+`cache=None`. In that mode the Coordinator never reads the cache and
+never writes to it. The cache DB file is untouched.
+
+`--dry-run` implies `--no-cache` internally: the dry-run evaluator
+produces synthetic fitness values, and those must never enter the
+cache. See D-092.
+
+**Why**: `--no-cache` is the escape hatch for "I think the cache is
+poisoned" or "I'm testing a hypothesis that requires fresh
+simulations". Making it disable only reads would leave the cache
+polluted with whatever the run produced; making it disable only writes
+would defeat the purpose. Both must go together.
+
+The dry-run interaction is not obvious from the flag name. A user
+running `--dry-run` for a quick smoke test would not expect their
+synthetic fitness values to enter a real cache. Making the two flags
+compose as "dry-run always wins" removes a footgun.
+
+The cache DB file is not deleted by `--no-cache`. Deleting it is
+`wqgp cache clear`'s job, which is a deliberate separate action.
+
+**Revisit if**: a "shadow run" mode appears where the user wants fresh
+BRAIN evaluations but the results should still be written to the
+cache. Then the flag becomes two flags (`--no-cache-read` and
+`--no-cache-write`) with `--no-cache` as the union. Do NOT split
+preemptively; the current single flag matches every use case seen so
+far.
+
+---
+
+## D-148 — Cache lookups and writes are logged at INFO when non-zero
+
+**Decision**: the Coordinator logs one INFO line per generation that
+has cache hits:
+
+    [run_id] cache: N hits this generation (no BRAIN submissions)
+
+The run-end summary includes a cumulative `cache_hits=N` field.
+
+**Why**: a cache that never reports its activity is invisible. The
+user's first question after a run that seemed faster than expected is
+"did it use the cache?". Without a log line, the answer requires
+manual SQLite queries.
+
+The counter is per-generation, not per-simulation. Per-simulation logs
+would flood the `wqgp.gp` channel on a warm run where every individual
+hits. One line per generation conveys the same information at a
+fraction of the noise.
+
+Zero-hit generations do not log, so the channel stays quiet when the
+cache is disabled or cold.
+
+**Revisit if**: the per-generation summary becomes insufficient — for
+example if the user wants to know *which* expressions were hits. Then
+add a DEBUG line per hit. Do NOT switch the per-generation line to
+DEBUG; it is the headline number.
+
+---
+
+## D-149 — Fitness sharing is opt-in via diversity_enabled
+
+**Decision**: `SelectionConfig` gains a `diversity_enabled: bool = True`
+field. When True and `mode == "single"`, `next_generation` computes
+adjusted fitness and uses diversity-aware elite/tournament selection.
+When False, the old raw-fitness path is used verbatim.
+
+**Why**: the field-concentration problem was diagnosed from real data
+(gen 0: `anl4_cfi_flag` absent; gen 4: 72% of individuals use it). The
+cause is selection pressure, not initialization sampling. Fitness
+sharing addresses the cause by making similar individuals share
+breeding resources.
+
+The flag exists for A/B comparison: run once with diversity on and
+once with off, hold everything else constant, compare top-5 field
+distribution and best fitness. Without the flag, a comparison would
+require two separate code branches, which is worse.
+
+The default is True because the current baseline exhibits the problem
+this flag fixes. Users who want the old behavior set it to False.
+
+**Revisit if**: a future Pareto run also wants diversity pressure on
+top of non-dominated sorting. Then the flag's condition becomes
+`mode in ("single", "pareto")` and the Pareto selector also consults
+the shared fitness. That is a larger change; do not extend the flag
+until that need is concrete.
+
+---
+
+## D-150 — Similarity blends field and operator Jaccard at 0.7 / 0.3
+
+**Decision**: `similarity(a, b) = 0.7 * J_field(a, b) + 0.3 *
+J_operator(a, b)`, where each `J` is the Jaccard similarity over the
+corresponding set extracted from the AST.
+
+**Why**: two external reviews disagreed on the weight. One argued for
+0.8 / 0.2 because BRAIN's SELF_CORRELATION check is dominated by the
+underlying fields: `ts_sum(close, 60)` and `ts_mean(close, 60)` use
+the same field and will correlate highly even though their operators
+differ. The other argued for 0.6 / 0.4, warning that field-only
+similarity over-penalizes expressions that share a field but have
+completely different time scales, such as `ts_sum(close, 60)` vs
+`ts_delay(close, 5)`.
+
+Both arguments are correct for their examples. 0.7 is the midpoint:
+high enough that identical field sets alone (J_field=1, J_operator=0)
+yield similarity 0.7, well above the 0.4 floor, so strongly
+overlapping fields trigger sharing. Low enough that operator diversity
+still contributes a third of the signal.
+
+0.7 / 0.3 is a starting point, not a claim of optimality. The right
+way to tune it is to run 200-simulation A/B comparisons and look at
+top-5 field distribution and best Sharpe; not to reason further in
+the abstract.
+
+**Revisit if**: an A/B run shows the diversity mechanism is either
+too weak (field concentration still >50%) or too strong (best Sharpe
+drops by more than 20%). Then try 0.8/0.2 or 0.6/0.4 respectively.
+
+---
+
+## D-151 — Continuous kernel + rank utility + elite protection
+
+**Decision**: fitness sharing uses three components designed
+together.
+
+1. **Continuous similarity kernel**:
+
+       share(sim) = 0                          if sim <= 0.4
+       share(sim) = (sim - 0.4) / 0.6          otherwise
+
+   Similarity at or below 0.4 contributes nothing to crowding. Above
+   it, the contribution rises linearly to 1.0 at sim=1.0.
+
+2. **Rank utility instead of raw fitness**:
+
+       utility(i) = ((N - r_i + 1) / N) ** 2
+       adjusted(i) = utility(i) / crowding(i)
+
+   where `r_i` is the individual's rank by raw fitness (1 = best) and
+   N is the population size.
+
+3. **Elite protection**: when selecting elites with diversity on, one
+   slot is reserved for the raw-fitness best evaluated individual.
+   The remaining slots are filled by adjusted fitness.
+
+**Why continuous kernel**: a hard threshold at 0.5 produces a cliff:
+similarity 0.49 contributes nothing, 0.51 contributes 0.5. The cliff
+makes selection unstable at the boundary. The continuous kernel
+removes the discontinuity at the cost of one extra subtraction. The
+0.4 floor was chosen because our Jaccard scores rarely exceed 0.4 for
+genuinely unrelated expressions; below that, similarity is noise.
+
+**Why rank utility**: the raw fitness scale is `[-inf, +inf]` (negative
+Sharpe exists). Two naive approaches fail:
+
+- Dividing raw fitness by crowding when it is negative flips the
+  penalty into a bonus (`-0.5 / 2 = -0.25` looks better than `-0.5`).
+- Multiplying negative raw by crowding produces unbounded negative
+  values that can dominate comparisons.
+
+Rank utility maps every individual to `(0, 1]` regardless of fitness
+sign or magnitude. It sacrifices linear magnitude information in
+exchange for uniformity. That is the correct trade for a diversity
+mechanism: we are reallocating *breeding slots*, not re-scoring
+Sharpe.
+
+**Why elite protection**: sharing can over-penalize the current best
+if it happens to be surrounded by similar individuals in that
+generation. Without protection, the best individual can be displaced
+by a moderately good but isolated one. Reserving one slot for the
+raw-fitness best guarantees monotonic improvement of the best fitness
+across generations, which is the same invariant that D-061 protected
+for the pre-diversity design.
+
+**Revisit if**: A/B runs show the elite protection is unnecessary
+because the mechanism never over-penalizes the best, or because it
+stabilizes too much and slows exploration. Then try 0 protected slots.
+Do NOT remove the protection until A/B data exists; the cost of
+keeping it is one less diverse elite, which is negligible.
+
+---

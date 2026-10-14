@@ -1,15 +1,13 @@
-"""Coordinator + Notifier integration tests. Phase 4 Step 3 gate.
-
-These tests verify that the Coordinator emits the right events in the
-right order, using a recording notifier. No network involved.
-"""
+"""Coordinator + Notifier integration tests. Phase 4 Step 3 gate."""
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
+from wqgp.brain.settings import BrainSettings
 from wqgp.budget import Budget
 from wqgp.coordinator import Coordinator, RunConfig
+from wqgp.evaluation_config import EvaluationConfig
 from wqgp.execution import Task, TaskResult, TaskStatus
 from wqgp.field import FieldDef
 from wqgp.notification.events import (
@@ -23,11 +21,7 @@ from wqgp.selection import SelectionConfig
 from wqgp.types import DataType, ParamDomain, SemanticKind
 
 
-# --- recording notifier -----------------------------------------------------
-
 class RecordingNotifier:
-    """Test double for Notifier: appends every event to a list."""
-
     def __init__(self) -> None:
         self.events: list[Any] = []
 
@@ -42,9 +36,6 @@ class RecordingNotifier:
 
 
 class RaisingNotifier:
-    """Notifier whose methods always raise. Used to verify D-095 at the
-    Coordinator level (defense in depth)."""
-
     def on_run_start(self, event: RunStartEvent) -> None:
         raise RuntimeError("boom on_start")
 
@@ -54,8 +45,6 @@ class RaisingNotifier:
     def on_run_end(self, event: RunEndEvent) -> None:
         raise RuntimeError("boom on_end")
 
-
-# --- fixtures ---------------------------------------------------------------
 
 def _matrix_field(fid: str) -> FieldDef:
     return FieldDef(fid, DataType.MATRIX, SemanticKind.NUMERIC, "pv1")
@@ -87,16 +76,14 @@ def _ts_mean() -> OperatorDef:
 
 def _pool() -> Pool:
     return Pool(
-        fields=FieldPool(
-            [
-                _matrix_field("close"),
-                _matrix_field("open"),
-                _matrix_field("high"),
-                _matrix_field("low"),
-                _matrix_field("volume"),
-                _matrix_field("vwap"),
-            ]
-        ),
+        fields=FieldPool([
+            _matrix_field("close"),
+            _matrix_field("open"),
+            _matrix_field("high"),
+            _matrix_field("low"),
+            _matrix_field("volume"),
+            _matrix_field("vwap"),
+        ]),
         operators=OperatorPool([_add(), _sub(), _ts_mean()]),
     )
 
@@ -122,6 +109,7 @@ def _config(
             max_breeding_attempts=200,
         ),
         seed=seed,
+        evaluation_config=EvaluationConfig(BrainSettings()),
         max_generations=max_generations,
         checkpoint_root=tmp_path / "ckpt",
         evaluation_db=tmp_path / "eval.db",
@@ -139,8 +127,6 @@ def _deterministic_evaluator(task: Task) -> TaskResult:
     )
 
 
-# --- tests ------------------------------------------------------------------
-
 def test_events_emitted_in_order(tmp_path: Path) -> None:
     rec = RecordingNotifier()
     cfg = _config(tmp_path, max_generations=2)
@@ -149,7 +135,6 @@ def test_events_emitted_in_order(tmp_path: Path) -> None:
     kinds = [type(e).__name__ for e in rec.events]
     assert kinds[0] == "RunStartEvent"
     assert kinds[-1] == "RunEndEvent"
-    # Every event between is a GenerationEndEvent.
     assert all(k == "GenerationEndEvent" for k in kinds[1:-1])
     assert len(kinds) >= 3
 
@@ -167,15 +152,9 @@ def test_run_start_reports_new_vs_resuming(tmp_path: Path) -> None:
 
 
 def test_run_start_reports_resuming(tmp_path: Path) -> None:
-    """To be resuming, the prior run must have completed at least one
-    next_generation. A max_generations=1 run stops before that step and
-    leaves only the initial generation-0 checkpoint. See D-067 and D-100.
-    """
-    # First pass: two generations ensures a generation-1 checkpoint.
     cfg1 = _config(tmp_path, max_generations=2)
     Coordinator(cfg1, _deterministic_evaluator).run()
 
-    # Second pass: same run_id, more generations -> resumed from gen 1.
     rec = RecordingNotifier()
     cfg2 = _config(tmp_path, max_generations=3)
     Coordinator(cfg2, _deterministic_evaluator, rec).run()
@@ -216,7 +195,6 @@ def test_run_end_reports_reason(tmp_path: Path) -> None:
 
 
 def test_no_notifier_means_null_notifier(tmp_path: Path) -> None:
-    """A Coordinator constructed without a notifier must run fine."""
     cfg = _config(tmp_path, max_generations=1)
     result = Coordinator(cfg, _deterministic_evaluator).run()
     assert result.stopped_reason in {
@@ -225,12 +203,9 @@ def test_no_notifier_means_null_notifier(tmp_path: Path) -> None:
 
 
 def test_raising_notifier_does_not_break_run(tmp_path: Path) -> None:
-    """D-095 at the Coordinator level: even a notifier that always
-    raises must not stop the run."""
     cfg = _config(tmp_path, max_generations=2)
     result = Coordinator(
         cfg, _deterministic_evaluator, RaisingNotifier()
     ).run()
-    # Run completed and produced a population.
     assert len(result.population) >= 1
     assert result.total_simulations_used >= 1

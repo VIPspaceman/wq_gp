@@ -14,10 +14,13 @@ Design decisions:
 - `build-pool` accepts simulation settings flags. See D-107.
 - Logs go to the "wqgp.cli" channel. See D-134.
 - `--settings` and `--run-config` split the two loader roles.
-  `--config` remains as a backward-compatible alias for both.
-  See D-136.
+  `--config` remains as a backward-compatible alias. See D-136.
 - `cache` subcommand inspects and manages the cross-run evaluation
   cache. See D-138.
+- `run` builds an EvaluationConfig (shared by the cache key and the
+  BrainClient request) and an EvaluationCache, passes both to the
+  Coordinator. `--no-cache` disables the cache; `--no-diversity`
+  disables fitness sharing. See D-146, D-147, D-149.
 """
 from __future__ import annotations
 
@@ -44,8 +47,10 @@ from wqgp.brain.pool_builder import (
 )
 from wqgp.brain.transport import HttpTransport, RequestsTransport
 from wqgp.budget import Budget
+from wqgp.cache import EvaluationCache
 from wqgp.checkpoint import CheckpointStore, CorruptCheckpointError
 from wqgp.coordinator import Coordinator, CoordinatorError, RunConfig
+from wqgp.evaluation_config import EvaluationConfig
 from wqgp.execution import Evaluator, Task, TaskResult, TaskStatus
 from wqgp.logging_setup import LoggingSettings, setup_logging
 from wqgp.notification.null import NullNotifier
@@ -92,11 +97,6 @@ _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
 def _resolve_settings_path(args: argparse.Namespace) -> Path | None:
-    """Pick the settings file path from flags.
-
-    `--settings` wins if given. Otherwise `--config` is used for
-    backward compatibility. If neither is set, returns None.
-    """
     settings_path = getattr(args, "settings", None)
     if settings_path:
         return Path(settings_path)
@@ -107,7 +107,6 @@ def _resolve_settings_path(args: argparse.Namespace) -> Path | None:
 
 
 def _load_settings(args: argparse.Namespace) -> Settings:
-    """Load the settings file, if given. Apply --log-level / --log-file."""
     path = _resolve_settings_path(args)
     try:
         settings = Settings.load(path)
@@ -157,11 +156,6 @@ def _load_settings(args: argparse.Namespace) -> Settings:
 
 
 def _resolve_credentials(settings: Settings) -> BrainCredentials:
-    """Resolve BRAIN credentials.
-
-    Precedence: env vars > config file > error. Env vars win because
-    they are the safer channel. See D-089 and D-135.
-    """
     try:
         return BrainCredentials.from_env()
     except BrainAuthError:
@@ -189,7 +183,6 @@ def _resolve_credentials(settings: Settings) -> BrainCredentials:
 # --- transport factory (patched in tests) -----------------------------------
 
 def _make_transport(args: argparse.Namespace) -> HttpTransport:
-    """Return the HTTP transport to use. Tests replace this function."""
     return RequestsTransport()
 
 
@@ -211,11 +204,6 @@ def _load_config(path: Path | None) -> dict[str, Any]:
 
 
 def _resolve_run_config_path(args: argparse.Namespace) -> Path | None:
-    """Pick the run-config file path from flags.
-
-    `--run-config` wins if given. Otherwise `--config` is used for
-    backward compatibility.
-    """
     run_config = getattr(args, "run_config", None)
     if run_config:
         return Path(run_config)
@@ -253,11 +241,17 @@ def _require(
     return v
 
 
-def _settings_from_args(args: argparse.Namespace) -> BrainSettings:
-    """Build a BrainSettings from CLI flags + settings defaults."""
+def _build_evaluation_config(
+    args: argparse.Namespace,
+) -> EvaluationConfig:
+    """Construct the single EvaluationConfig used for the whole run.
+
+    Both the cache key and the BRAIN request derive from this object,
+    so they cannot disagree about the settings. See D-138.
+    """
     defaults = BrainSettings()
     settings_defaults = args._settings.defaults
-    return BrainSettings(
+    return EvaluationConfig(BrainSettings(
         instrument_type=getattr(args, "instrument_type", None)
         or settings_defaults.instrument_type
         or defaults.instrument_type,
@@ -276,7 +270,7 @@ def _settings_from_args(args: argparse.Namespace) -> BrainSettings:
                 else defaults.delay
             )
         ),
-    )
+    ))
 
 
 # --- argument parser --------------------------------------------------------
@@ -307,7 +301,6 @@ def _add_settings_flags(p: argparse.ArgumentParser) -> None:
 
 
 def _add_path_flags(p: argparse.ArgumentParser) -> None:
-    """Flags for splitting settings from run config."""
     p.add_argument(
         "--settings",
         default=None,
@@ -394,7 +387,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_bp.add_argument(
         "--settings", default=None,
-        help="path to the settings file (logging / defaults / credentials)",
+        help="path to the settings file",
     )
     p_bp.add_argument(
         "--config", default=None,
@@ -445,6 +438,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--dry-run", action="store_true",
         help="use a deterministic fake evaluator; do not contact BRAIN",
+    )
+    p_run.add_argument(
+        "--no-diversity", action="store_true",
+        help=(
+            "disable fitness sharing (diversity mechanism); "
+            "falls back to raw-fitness selection. See D-149."
+        ),
+    )
+    p_run.add_argument(
+        "--no-cache", action="store_true",
+        help=(
+            "ignore the cross-run evaluation cache for this run: "
+            "every individual is submitted to BRAIN and nothing is "
+            "written back to the cache. See D-147."
+        ),
     )
     p_run.add_argument(
         "--telegram", action="store_true",
@@ -515,7 +523,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_cs.add_argument(
         "--settings", default=None,
-        help="path to the settings file (for cache.ttl_days)",
+        help="path to the settings file",
     )
     p_cs.add_argument(
         "--config", default=None,
@@ -574,6 +582,7 @@ def _dry_run_evaluator(task: Task) -> TaskResult:
 def _make_evaluator(
     args: argparse.Namespace,
     settings: Settings,
+    evaluation_config: EvaluationConfig,
 ) -> Evaluator:
     if args.dry_run:
         log.warning("dry-run mode: BRAIN will not be contacted")
@@ -587,26 +596,20 @@ def _make_evaluator(
     if max_concurrent is None:
         max_concurrent = settings.defaults.max_concurrent
 
-    brain_settings = _settings_from_args(args)
     return _build_client_with_creds(
-        creds, brain_settings, max_concurrent,
+        creds, evaluation_config, max_concurrent,
     )
 
 
 def _build_client_with_creds(
     creds: BrainCredentials,
-    settings: BrainSettings,
+    evaluation_config: EvaluationConfig,
     max_concurrent: int,
 ):
-    """Construct a BrainClient from explicit credentials.
-
-    Mirrors build_default_client but accepts pre-resolved credentials
-    so that config-file credentials flow through. See D-135.
-    """
     from wqgp.brain.client import BrainClient
     return BrainClient(
         credentials=creds,
-        settings=settings,
+        settings=evaluation_config.settings,
         transport=RequestsTransport(),
         max_concurrent=max_concurrent,
     )
@@ -623,6 +626,25 @@ def _make_notifier(args: argparse.Namespace) -> Notifier:
     return TelegramNotifier(credentials=creds, transport=transport)
 
 
+def _make_cache(
+    args: argparse.Namespace,
+    settings: Settings,
+) -> EvaluationCache | None:
+    if getattr(args, "no_cache", False):
+        log.info("cache disabled by --no-cache")
+        return None
+    if not settings.cache.enabled:
+        log.info("cache disabled by settings.cache.enabled=false")
+        return None
+    if getattr(args, "dry_run", False):
+        log.info("cache disabled (dry-run does not produce real results)")
+        return None
+
+    path = _resolve_cache_path(args, settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return EvaluationCache(path, ttl_days=settings.cache.ttl_days)
+
+
 # --- commands: build-pool ---------------------------------------------------
 
 def _cmd_build_pool(args: argparse.Namespace) -> int:
@@ -637,7 +659,8 @@ def _cmd_build_pool(args: argparse.Namespace) -> int:
     except BrainAuthError as e:
         raise CliError(str(e)) from e
 
-    settings = _settings_from_args(args)
+    evaluation_config = _build_evaluation_config(args)
+    settings = evaluation_config.settings
     transport = _make_transport(args)
     builder = PoolBuilder(
         credentials=creds,
@@ -724,6 +747,12 @@ def _resolve_selection(
             )
         pareto_objectives.append((str(entry[0]), str(entry[1])))
 
+    diversity_enabled = bool(_pick(
+        args, s, "diversity_enabled", "diversity_enabled", True,
+    ))
+    if getattr(args, "no_diversity", False):
+        diversity_enabled = False
+
     return SelectionConfig(
         population_size=int(
             _pick(
@@ -757,6 +786,7 @@ def _resolve_selection(
         ),
         mode=str(mode),
         pareto_objectives=tuple(pareto_objectives),
+        diversity_enabled=diversity_enabled,
     )
 
 
@@ -782,12 +812,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "initial_population_size", None,
     )
 
+    evaluation_config = _build_evaluation_config(args)
+
     run_cfg = RunConfig(
         run_id=str(_require(args, cfg, "run_id", "run_id", "--run-id")),
         pool=pool,
         budget=_resolve_budget(args, cfg),
         selection=_resolve_selection(args, cfg),
         seed=int(_pick(args, cfg, "seed", "seed", defaults.seed)),
+        evaluation_config=evaluation_config,
         max_generations=int(
             _pick(
                 args, cfg, "max_generations", "max_generations",
@@ -826,18 +859,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.info("starting new run %s", run_cfg.run_id)
 
-    evaluator = _make_evaluator(args, settings)
+    evaluator = _make_evaluator(args, settings, evaluation_config)
     notifier = _make_notifier(args)
+    cache = _make_cache(args, settings)
 
     try:
-        result = Coordinator(run_cfg, evaluator, notifier).run()
+        result = Coordinator(
+            run_cfg, evaluator, notifier, cache=cache
+        ).run()
     except CoordinatorError as e:
         raise CliError(f"coordinator error: {e}") from e
+    finally:
+        if cache is not None:
+            cache.close()
 
     log.info(
-        "run %s finished: reason=%s generation=%d total_simulations=%d",
+        "run %s finished: reason=%s generation=%d total_simulations=%d "
+        "cache_hits=%d",
         run_cfg.run_id, result.stopped_reason,
         result.generation, result.total_simulations_used,
+        result.cache_hits,
     )
     return EXIT_OK
 
@@ -943,12 +984,6 @@ def _resolve_cache_path(
     args: argparse.Namespace,
     settings: Settings,
 ) -> Path:
-    """Pick the cache DB path.
-
-    Priority: --cache-path flag > settings.cache.path >
-    <checkpoint_root>/cache.db. The last fallback keeps the cache next
-    to the run DBs, which is what most users will want.
-    """
     override = getattr(args, "cache_path", None)
     if override:
         return Path(override)
@@ -967,8 +1002,6 @@ def _cmd_cache_help(args: argparse.Namespace) -> int:
 
 
 def _cmd_cache_stats(args: argparse.Namespace) -> int:
-    from wqgp.cache import EvaluationCache
-
     settings = args._settings
     path = _resolve_cache_path(args, settings)
 
@@ -1004,8 +1037,6 @@ def _cmd_cache_stats(args: argparse.Namespace) -> int:
 
 
 def _cmd_cache_clear(args: argparse.Namespace) -> int:
-    from wqgp.cache import EvaluationCache
-
     settings = args._settings
     path = _resolve_cache_path(args, settings)
 

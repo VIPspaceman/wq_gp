@@ -9,12 +9,13 @@ Design decisions:
   TRANSIENT failures are never cached. See D-142.
 - TTL is a soft expiry: entries older than ttl_days are ignored on
   read but not deleted. Explicit clear() removes them. See D-143.
-- hit_count and last_hit_at are updated on every successful read, so
-  cache value can be measured.
+- hit_count and last_hit_at are updated on every successful read.
+- classify_failure() is the canonical classifier used both by the
+  Coordinator when writing fresh failures and by the one-off import
+  script when migrating historical runs. One list, one place. See
+  D-145.
 - in_flight columns are reserved for a future concurrency round and
-  are unused in this first version. See D-144.
-- WAL mode + busy_timeout so a future multi-process run does not hit
-  "database is locked".
+  are unused in this version. See D-144.
 """
 from __future__ import annotations
 
@@ -60,6 +61,36 @@ class ErrorType(str, Enum):
     TRANSIENT member. See D-142.
     """
     PERMANENT = "PERMANENT"
+
+
+# --- failure classification -------------------------------------------------
+#
+# Only these patterns are treated as PERMANENT. Everything else — the
+# client's own timeouts, HTTP 5xx, 429, auth errors — is skipped.
+# Adding a pattern here is a promise that the error will not go away by
+# retrying the same expression under the same settings. See D-145.
+_PERMANENT_PATTERNS: tuple[str, ...] = (
+    "incompatible unit",
+    "simulation error",
+    "complete response without 'alpha' id",
+    "alpha response missing 'is' block",
+)
+
+
+def classify_failure(error: str | None) -> ErrorType | None:
+    """Return PERMANENT if the error is recognized, else None (skip).
+
+    Conservative by design: unknown messages are treated as transient
+    so a future run can retry them. This is the only place that maps
+    error strings to ErrorType. See D-145.
+    """
+    if not error:
+        return None
+    lowered = error.lower()
+    for pattern in _PERMANENT_PATTERNS:
+        if pattern.lower() in lowered:
+            return ErrorType.PERMANENT
+    return None
 
 
 # --- entry ------------------------------------------------------------------
@@ -207,16 +238,7 @@ _SELECT_COLS = (
 
 
 class EvaluationCache:
-    """Thread-safe SQLite cache for BRAIN evaluation results.
-
-    Lifecycle:
-        cache = EvaluationCache(path, ttl_days=90)
-        entry = cache.get(cache_key)          # updates hit stats
-        cache.put(entry)
-        stats = cache.stats()
-        removed = cache.clear(before_ts=None)
-        cache.close()
-    """
+    """Thread-safe SQLite cache for BRAIN evaluation results."""
 
     __slots__ = ("_path", "_ttl_days", "_lock", "_conn")
 
@@ -267,12 +289,6 @@ class EvaluationCache:
     # --- read/write ----------------------------------------------------
 
     def get(self, cache_key: str) -> CacheEntry | None:
-        """Return the entry for `cache_key` if it exists and is fresh.
-
-        A fresh hit also bumps hit_count and last_hit_at. An entry
-        older than ttl_days is treated as absent but NOT deleted;
-        call clear() to remove it. See D-143.
-        """
         if not cache_key:
             raise ValueError("cache_key must be non-empty")
 
@@ -302,7 +318,6 @@ class EvaluationCache:
         return self._row_to_entry(row)
 
     def put(self, entry: CacheEntry) -> None:
-        """Insert or replace a cache entry."""
         with self._lock:
             self._conn.execute(_UPSERT, self._entry_to_params(entry))
             self._conn.commit()
@@ -356,7 +371,6 @@ class EvaluationCache:
         )
 
     def clear(self, *, before_ts: float | None = None) -> int:
-        """Delete entries. None -> all; float -> older than that time."""
         with self._lock:
             if before_ts is None:
                 cur = self._conn.execute("DELETE FROM evaluation_cache")

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from wqgp.brain.settings import BrainSettings
 from wqgp.budget import Budget
 from wqgp.coordinator import (
     Coordinator,
@@ -12,6 +13,7 @@ from wqgp.coordinator import (
     RunConfig,
     RunResult,
 )
+from wqgp.evaluation_config import EvaluationConfig
 from wqgp.execution import Task, TaskResult, TaskStatus
 from wqgp.field import FieldDef
 from wqgp.operator import OperatorDef
@@ -19,8 +21,6 @@ from wqgp.pool import FieldPool, OperatorPool, Pool
 from wqgp.selection import SelectionConfig
 from wqgp.types import DataType, ParamDomain, SemanticKind
 
-
-# --- fixtures ---------------------------------------------------------------
 
 def _field(fid: str) -> FieldDef:
     return FieldDef(fid, DataType.MATRIX, SemanticKind.NUMERIC, "pv1")
@@ -52,18 +52,16 @@ def _ts_mean() -> OperatorDef:
 
 def _pool() -> Pool:
     return Pool(
-        fields=FieldPool(
-            [
-                _field("close"),
-                _field("open"),
-                _field("high"),
-                _field("low"),
-                _field("volume"),
-                _field("vwap"),
-            ]
-        ),
+        fields=FieldPool([
+            _field("close"), _field("open"), _field("high"),
+            _field("low"), _field("volume"), _field("vwap"),
+        ]),
         operators=OperatorPool([_add(), _sub(), _ts_mean()]),
     )
+
+
+def _evaluation_config() -> EvaluationConfig:
+    return EvaluationConfig(BrainSettings())
 
 
 def _config(
@@ -87,6 +85,7 @@ def _config(
             max_breeding_attempts=200,
         ),
         seed=seed,
+        evaluation_config=_evaluation_config(),
         max_generations=max_generations,
         checkpoint_root=tmp_path / "ckpt",
         evaluation_db=tmp_path / "eval.db",
@@ -95,7 +94,6 @@ def _config(
 
 
 def _deterministic_evaluator(task: Task) -> TaskResult:
-    """Fitness derived from the expression text; deterministic, fast."""
     fit = float(sum(ord(c) for c in task.expression) % 100) / 10.0
     return TaskResult(
         fingerprint=task.fingerprint,
@@ -119,6 +117,7 @@ def test_config_rejects_bad_run_id(tmp_path: Path) -> None:
             budget=Budget(total_simulations=10),
             selection=SelectionConfig(population_size=4),
             seed=0,
+            evaluation_config=_evaluation_config(),
             checkpoint_root=tmp_path,
         )
 
@@ -131,6 +130,7 @@ def test_config_rejects_zero_generations(tmp_path: Path) -> None:
             budget=Budget(total_simulations=10),
             selection=SelectionConfig(population_size=4),
             seed=0,
+            evaluation_config=_evaluation_config(),
             max_generations=0,
             checkpoint_root=tmp_path,
         )
@@ -144,14 +144,13 @@ def test_config_rejects_zero_workers(tmp_path: Path) -> None:
             budget=Budget(total_simulations=10),
             selection=SelectionConfig(population_size=4),
             seed=0,
+            evaluation_config=_evaluation_config(),
             checkpoint_root=tmp_path,
             n_workers=0,
         )
 
 
-def test_config_rejects_bad_initial_population_size(
-    tmp_path: Path,
-) -> None:
+def test_config_rejects_bad_initial_population_size(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         RunConfig(
             run_id="r",
@@ -159,6 +158,7 @@ def test_config_rejects_bad_initial_population_size(
             budget=Budget(total_simulations=10),
             selection=SelectionConfig(population_size=4),
             seed=0,
+            evaluation_config=_evaluation_config(),
             checkpoint_root=tmp_path,
             initial_population_size=0,
         )
@@ -208,9 +208,7 @@ def test_run_different_seeds_diverge(tmp_path: Path) -> None:
 # --- budget -----------------------------------------------------------------
 
 def test_run_stops_at_budget_exhaustion(tmp_path: Path) -> None:
-    cfg = _config(
-        tmp_path, max_generations=10, pop_size=20, total_sims=5
-    )
+    cfg = _config(tmp_path, max_generations=10, pop_size=20, total_sims=5)
     coord = Coordinator(cfg, _deterministic_evaluator)
     result = coord.run()
     assert result.budget_exhausted is True
@@ -219,9 +217,7 @@ def test_run_stops_at_budget_exhaustion(tmp_path: Path) -> None:
 
 
 def test_run_respects_max_generations(tmp_path: Path) -> None:
-    cfg = _config(
-        tmp_path, max_generations=3, pop_size=4, total_sims=500
-    )
+    cfg = _config(tmp_path, max_generations=3, pop_size=4, total_sims=500)
     result = Coordinator(cfg, _deterministic_evaluator).run()
     assert result.generation == 2
     assert not result.budget_exhausted
@@ -239,17 +235,12 @@ def test_run_writes_checkpoint(tmp_path: Path) -> None:
 
 
 def test_resume_preserves_evolution(tmp_path: Path) -> None:
-    """A run interrupted after generation 0, then resumed, must produce
-    the same final population as an uninterrupted run."""
-    # Reference: single 3-generation run.
     cfg_ref = _config(
         tmp_path / "ref", max_generations=3, pop_size=4, seed=7
     )
     r_ref = Coordinator(cfg_ref, _deterministic_evaluator).run()
     fps_ref = sorted(i.fingerprint for i in r_ref.population)
 
-    # Interrupted: one generation, then resume with the same config
-    # but a higher max_generations.
     cfg1 = _config(
         tmp_path / "resume", max_generations=1, pop_size=4, seed=7
     )
@@ -276,8 +267,6 @@ def test_resume_reaches_generation(tmp_path: Path) -> None:
 # --- failure handling -------------------------------------------------------
 
 def test_failing_evaluator_does_not_crash_run(tmp_path: Path) -> None:
-    """A failing evaluator produces no evaluated individuals, so the run
-    stops with 'no_progress' instead of crashing."""
     cfg = _config(tmp_path, max_generations=1, pop_size=4)
     result = Coordinator(cfg, _failing_evaluator).run()
     assert isinstance(result, RunResult)
@@ -292,6 +281,7 @@ def test_impossible_initial_generation_raises(tmp_path: Path) -> None:
         budget=Budget(total_simulations=10),
         selection=SelectionConfig(population_size=4),
         seed=0,
+        evaluation_config=_evaluation_config(),
         max_generations=1,
         checkpoint_root=tmp_path / "ckpt",
         evaluation_db=tmp_path / "eval.db",
@@ -301,11 +291,7 @@ def test_impossible_initial_generation_raises(tmp_path: Path) -> None:
         coord.run()
 
 
-def test_elites_not_reevaluated_across_generations(
-    tmp_path: Path,
-) -> None:
-    """With elite_count=1, the elite is carried over and already has a
-    fitness in the store. It must not be re-submitted."""
+def test_elites_not_reevaluated_across_generations(tmp_path: Path) -> None:
     submitted_count = {"n": 0}
 
     def counting_evaluator(task: Task) -> TaskResult:
@@ -314,7 +300,4 @@ def test_elites_not_reevaluated_across_generations(
 
     cfg = _config(tmp_path, max_generations=3, pop_size=4, total_sims=500)
     Coordinator(cfg, counting_evaluator).run()
-    # A 3-generation run with pop_size=4 would submit up to 4*3=12
-    # evaluations if elites were re-submitted. With elite_count=1,
-    # the ceiling is lower; a loose bound is fine here.
     assert submitted_count["n"] <= 12

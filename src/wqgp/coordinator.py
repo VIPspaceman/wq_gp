@@ -5,29 +5,41 @@ Design decisions:
   See D-065.
 - Expression rendering lives in ast.py. See D-066.
 - Checkpoints save the UNEVALUATED next-generation population. See D-067.
-- Before submitting, existing evaluations are absorbed from the store
-  so elites and resumed individuals are not re-submitted. See D-068.
+- Before submitting, existing evaluations are absorbed from the store.
+  See D-068.
 - One Executor for the whole run. See D-069.
-- The loop ends on budget exhaustion, zero evaluated individuals, or
-  reaching max_generations. See D-070.
+- The loop ends on budget exhaustion, no-progress, or max_generations.
+  See D-070.
 - Notifications are optional; the default is NullNotifier. See D-098.
-- Per-generation progress is logged at INFO to the "wqgp.gp" channel.
-  See D-115 and D-132.
-- FAILED evaluations propagate to the Individual's status so the
-  individual is not resubmitted. See D-125.
+- Per-generation progress logs at INFO to "wqgp.gp". See D-115 / D-134.
+- FAILED evaluations propagate to the Individual's status. See D-125.
+- If a cache is provided, _evaluate consults it before submitting and
+  _merge_evaluations writes every reusable result back to it. The
+  run DB is still written in both cases. See D-146.
+- RunConfig now carries an EvaluationConfig, the single source of
+  truth for a simulation's identity. See D-138.
 """
 from __future__ import annotations
 
+import json
 import logging
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from wqgp._ids import validate_run_id
 from wqgp.ast import render as render_ast
 from wqgp.budget import Budget, BudgetTracker
+from wqgp.cache import (
+    CacheEntry,
+    CacheStatus,
+    EvaluationCache,
+    classify_failure,
+)
 from wqgp.checkpoint import Checkpoint, CheckpointStore
 from wqgp.crossover import Crossover
+from wqgp.evaluation_config import EvaluationConfig
 from wqgp.execution import Evaluator, Executor, Task
 from wqgp.gp_serialization import (
     population_from_dict,
@@ -68,6 +80,7 @@ class RunConfig:
     budget: Budget
     selection: SelectionConfig
     seed: int
+    evaluation_config: EvaluationConfig
     max_generations: int = 10
     checkpoint_root: Path = Path("./checkpoints")
     evaluation_db: Path | None = None
@@ -109,23 +122,22 @@ class RunResult:
     total_simulations_used: int
     budget_exhausted: bool
     stopped_reason: str
+    cache_hits: int = 0
 
 
 class Coordinator:
-    """Drives the GP loop end to end.
-
-    Owns the EvaluationStore, CheckpointStore, Mutator, and Crossover.
-    Creates one Executor per `run()` call.
-    """
+    """Drives the GP loop end to end."""
 
     __slots__ = (
         "_config",
         "_evaluator",
         "_notifier",
+        "_cache",
         "_store",
         "_ckpt_store",
         "_mutator",
         "_crossover",
+        "_cache_hits",
     )
 
     def __init__(
@@ -133,12 +145,15 @@ class Coordinator:
         config: RunConfig,
         evaluator: Evaluator,
         notifier: Notifier | None = None,
+        cache: EvaluationCache | None = None,
     ) -> None:
         self._config = config
         self._evaluator = evaluator
         self._notifier: Notifier = (
             notifier if notifier is not None else NullNotifier()
         )
+        self._cache = cache
+        self._cache_hits = 0
 
         if config.evaluation_db is not None:
             db_path = Path(config.evaluation_db)
@@ -162,9 +177,10 @@ class Coordinator:
 
         log.info(
             "[%s] run starting: generation=%d population=%d "
-            "max_generations=%d",
+            "max_generations=%d cache=%s",
             self._config.run_id, start_gen, len(pop),
             self._config.max_generations,
+            "on" if self._cache is not None else "off",
         )
 
         executor = Executor(
@@ -258,9 +274,6 @@ class Coordinator:
                 generation += 1
                 self._save_checkpoint(pop, tracker, rng, generation)
         finally:
-            # Shut down workers inside the try/finally so an exception
-            # in the loop does not leak threads. The store is closed
-            # below, after _log_summary has had a chance to read it.
             executor.shutdown()
 
         result = RunResult(
@@ -269,11 +282,10 @@ class Coordinator:
             total_simulations_used=tracker.total_simulations_used,
             budget_exhausted=budget_exhausted,
             stopped_reason=stopped_reason,
+            cache_hits=self._cache_hits,
         )
 
         try:
-            # _log_summary reads from the store; it must run while the
-            # store is still open. See D-133.
             self._log_summary(result)
         finally:
             self._store.close()
@@ -409,11 +421,22 @@ class Coordinator:
         tracker: BudgetTracker,
     ) -> int:
         submitted = 0
+        cache_hits_this_gen = 0
+
         for ind in pop:
             if ind.is_evaluated():
                 continue
             if ind.status is EvaluationStatus.FAILED:
                 continue
+
+            if self._cache is not None:
+                entry = self._lookup_cache(ind)
+                if entry is not None:
+                    self._record_cache_hit(ind, entry)
+                    cache_hits_this_gen += 1
+                    self._cache_hits += 1
+                    continue
+
             task = Task(
                 fingerprint=ind.fingerprint,
                 expression=render_ast(ind.ast),
@@ -425,7 +448,46 @@ class Coordinator:
 
         if submitted > 0:
             executor.run_until_drained()
+
+        if cache_hits_this_gen > 0:
+            log.info(
+                "[%s] cache: %d hits this generation "
+                "(no BRAIN submissions)",
+                self._config.run_id, cache_hits_this_gen,
+            )
         return submitted
+
+    def _lookup_cache(self, ind: Individual) -> CacheEntry | None:
+        assert self._cache is not None
+        key = self._config.evaluation_config.cache_key(ind.fingerprint)
+        return self._cache.get(key)
+
+    def _record_cache_hit(
+        self, ind: Individual, entry: CacheEntry
+    ) -> None:
+        from wqgp.persistence import EvaluationRecord
+
+        expression = render_ast(ind.ast)
+        if entry.status is CacheStatus.SUCCESS:
+            rec = EvaluationRecord(
+                run_id=self._config.run_id,
+                generation=ind.generation,
+                fingerprint=ind.fingerprint,
+                expression=expression,
+                status=EvaluationStatus.SUCCESS,
+                fitness=entry.fitness,
+                metrics=entry.metrics,
+            )
+        else:
+            rec = EvaluationRecord(
+                run_id=self._config.run_id,
+                generation=ind.generation,
+                fingerprint=ind.fingerprint,
+                expression=expression,
+                status=EvaluationStatus.FAILED,
+                error=entry.error,
+            )
+        self._store.record(rec)
 
     def _merge_evaluations(self, pop: Population) -> Population:
         updated: list[Individual] = []
@@ -447,12 +509,56 @@ class Coordinator:
                         metrics=rec.metrics,
                     )
                 )
+                self._cache_record(rec)
                 continue
             if rec.status is EvaluationStatus.FAILED:
                 updated.append(ind.with_status(EvaluationStatus.FAILED))
+                self._cache_record(rec)
                 continue
             updated.append(ind)
         return Population(updated)
+
+    def _cache_record(self, rec) -> None:
+        if self._cache is None:
+            return
+
+        cfg = self._config.evaluation_config
+        cache_key = cfg.cache_key(rec.fingerprint)
+        created_at = rec.created_at if rec.created_at > 0 else time.time()
+
+        if rec.status is EvaluationStatus.SUCCESS:
+            if rec.fitness is None:
+                return
+            self._cache.put(CacheEntry(
+                cache_key=cache_key,
+                fingerprint=rec.fingerprint,
+                settings_hash=cfg.settings_hash(),
+                settings_json=json.dumps(
+                    cfg.to_api_dict(), sort_keys=True,
+                ),
+                status=CacheStatus.SUCCESS,
+                fitness=rec.fitness,
+                metrics=rec.metrics,
+                created_at=created_at,
+            ))
+            return
+
+        if rec.status is EvaluationStatus.FAILED:
+            error_type = classify_failure(rec.error)
+            if error_type is None:
+                return
+            self._cache.put(CacheEntry(
+                cache_key=cache_key,
+                fingerprint=rec.fingerprint,
+                settings_hash=cfg.settings_hash(),
+                settings_json=json.dumps(
+                    cfg.to_api_dict(), sort_keys=True,
+                ),
+                status=CacheStatus.FAILED,
+                error=rec.error,
+                error_type=error_type,
+                created_at=created_at,
+            ))
 
     # --- helpers --------------------------------------------------------
 
@@ -466,7 +572,6 @@ class Coordinator:
         return best
 
     def _log_summary(self, result: RunResult) -> None:
-        """Print a run-end summary: reason, rates, top 3 by fitness."""
         rid = self._config.run_id
         counts = self._store.count_by_status(rid)
         success = counts.get("SUCCESS", 0)
@@ -476,9 +581,11 @@ class Coordinator:
 
         log.info(
             "[%s] run finished: reason=%s generations=%d "
-            "total_sims=%d success=%d failed=%d rate=%.1f%%",
+            "total_sims=%d success=%d failed=%d rate=%.1f%% "
+            "cache_hits=%d",
             rid, result.stopped_reason, result.generation,
             result.total_simulations_used, success, failed, rate,
+            result.cache_hits,
         )
 
         top = self._store.top_by_fitness(rid, 3)
@@ -492,7 +599,6 @@ class Coordinator:
             )
 
     def _safe_notify(self, fn, event) -> None:
-        """Call a notifier method. Swallows everything (D-095)."""
         try:
             fn(event)
         except Exception:  # noqa: BLE001 -- D-095
