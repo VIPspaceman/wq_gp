@@ -2,11 +2,16 @@
   "logging": {
     "level": "INFO",
     "style": "default",
-    "components": {
-      "wqgp.brain.client": "DEBUG",
-      "wqgp.execution": "WARNING"
-    },
-    "file": null
+    "file": "./logs/wqgp.log",
+    "channels": {
+      "brain": "INFO",
+      "gp": "INFO",
+      "pool": "INFO",
+      "execution": "OFF",
+      "storage": "WARNING",
+      "notification": "WARNING",
+      "cli": "INFO"
+    }
   },
   "defaults": {
     "region": "USA",

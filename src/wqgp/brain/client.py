@@ -20,16 +20,14 @@ Design decisions:
   {"status": "COMPLETE", "alpha": "<id>"} when done. Metrics are NOT
   in the poll response; a second GET /alphas/{id} is required. See
   D-110.
-- WARNING with a non-empty message is a terminal failure, not a
-  continuing state. See D-111.
+- WARNING with a non-empty message is a terminal failure. See D-111.
 - A semaphore bounds simultaneously active simulations. See D-112.
-- BrainSettings defaults match BRAIN's observed-accepted values.
-  See D-113.
+- All logs go to the "wqgp.brain" channel. See D-132.
 """
 from __future__ import annotations
 
-import os
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -42,7 +40,9 @@ from wqgp.brain.transport import (
     TransportError,
 )
 from wqgp.execution import Task, TaskResult, TaskStatus
-log = logging.getLogger(__name__)
+
+
+log = logging.getLogger("wqgp.brain")
 
 
 # --- errors -----------------------------------------------------------------
@@ -185,6 +185,38 @@ class SimulationResult:
         return dict(self.metrics)
 
 
+# --- helpers ---------------------------------------------------------------
+
+def _truncate(s: str, n: int) -> str:
+    """Shorten a string for a single log line, no newlines."""
+    s = s.replace("\n", " ").replace("\r", " ")
+    if len(s) <= n:
+        return s
+    return s[: n - 3] + "..."
+
+
+def _format_result_line(
+    *,
+    score: float | None,
+    metrics: MetricsView,
+    expression: str,
+    error: str | None,
+) -> str:
+    """One-line summary of a single simulation for the [result] log."""
+    expr = _truncate(expression, 100)
+    if error is not None:
+        return f"[result] FAILED err={_truncate(error, 80)} expr={expr}"
+
+    parts: list[str] = []
+    if score is not None:
+        parts.append(f"score={score:.4f}")
+    for key in ("sharpe", "fitness", "turnover", "drawdown", "returns"):
+        v = metrics.get(key)
+        if v is not None:
+            parts.append(f"{key}={v:.4f}")
+    return f"[result] {' '.join(parts)} expr={expr}"
+
+
 # --- client ------------------------------------------------------------------
 
 _BASE_URL = "https://api.worldquantbrain.com"
@@ -198,8 +230,6 @@ class BrainClient:
     Thread-safety:
     - Login state is guarded by a lock.
     - Active simulations are bounded by a semaphore (D-112).
-    Both are reentrant-safe; multiple worker threads may call the
-    client concurrently.
     """
 
     __slots__ = (
@@ -267,18 +297,22 @@ class BrainClient:
     def __call__(self, task: Task) -> TaskResult:
         self._ensure_authenticated()
 
-        # Bound simultaneously active simulations. A slot is held
-        # across the whole submit+poll cycle, not just the POST. See
-        # D-112.
         self._concurrency_semaphore.acquire()
         try:
             try:
                 sim = self._submit_and_poll(task.expression)
             except BrainAuthError:
-                # Auth failure during submit/poll is a distinct channel:
-                # propagate unchanged. See D-078 and D-080.
                 raise
             except BrainClientError as e:
+                log.info(
+                    "%s",
+                    _format_result_line(
+                        score=None,
+                        metrics={},
+                        expression=task.expression,
+                        error=str(e),
+                    ),
+                )
                 return TaskResult(
                     fingerprint=task.fingerprint,
                     status=TaskStatus.FAILED,
@@ -287,21 +321,50 @@ class BrainClient:
         finally:
             self._concurrency_semaphore.release()
 
+        metrics_dict = sim.metrics_dict()
+
         if sim.error_message is not None:
+            log.info(
+                "%s",
+                _format_result_line(
+                    score=None,
+                    metrics=metrics_dict,
+                    expression=task.expression,
+                    error=sim.error_message,
+                ),
+            )
             return TaskResult(
                 fingerprint=task.fingerprint,
                 status=TaskStatus.FAILED,
                 error=sim.error_message,
             )
 
-        fitness = self._fitness_fn(sim.metrics_dict())
+        fitness = self._fitness_fn(metrics_dict)
         if fitness is None:
+            log.info(
+                "%s",
+                _format_result_line(
+                    score=None,
+                    metrics=metrics_dict,
+                    expression=task.expression,
+                    error="no fitness derivable",
+                ),
+            )
             return TaskResult(
                 fingerprint=task.fingerprint,
                 status=TaskStatus.FAILED,
                 error="no fitness derivable from metrics",
             )
 
+        log.info(
+            "%s",
+            _format_result_line(
+                score=float(fitness),
+                metrics=metrics_dict,
+                expression=task.expression,
+                error=None,
+            ),
+        )
         return TaskResult(
             fingerprint=task.fingerprint,
             status=TaskStatus.SUCCESS,
@@ -319,6 +382,10 @@ class BrainClient:
             self._authenticated = True
 
     def _login_locked(self) -> None:
+        log.info(
+            "login: attempting (user=%s)", self._credentials.username
+        )
+        started = time.monotonic()
         try:
             resp = self._transport.request(
                 "POST",
@@ -327,12 +394,19 @@ class BrainClient:
                 timeout=self._http_timeout,
             )
         except TransportError as e:
+            log.error("login: transport error: %s", e)
             raise BrainAuthError(f"login transport error: {e}") from e
 
+        elapsed = time.monotonic() - started
         if resp.status_code not in (200, 201):
+            log.error(
+                "login: failed HTTP %d in %.2fs",
+                resp.status_code, elapsed,
+            )
             raise BrainAuthError(
                 f"login failed with HTTP {resp.status_code}"
             )
+        log.info("login: OK in %.2fs", elapsed)
 
     def _invalidate_auth(self) -> None:
         with self._lock:
@@ -345,6 +419,8 @@ class BrainClient:
         return self._poll(sim_url)
 
     def _submit(self, expression: str) -> str:
+        log.debug("[submit] %s", _truncate(expression, 80))
+
         body = {
             "type": "REGULAR",
             "settings": self._settings.to_api_dict(),
@@ -359,24 +435,32 @@ class BrainClient:
                 timeout=self._http_timeout,
             )
         except TransportError as e:
+            log.warning("[submit] transport error: %s", e)
             raise BrainClientError(f"submit transport error: {e}") from e
 
         if resp.status_code == 401:
             self._invalidate_auth()
+            log.warning("[submit] 401, invalidating auth")
             raise BrainAuthError("submit rejected: not authenticated")
 
         if resp.status_code == 429:
             detail = _extract_error_detail(resp)
             if "CONCURRENT_SIMULATION_LIMIT_EXCEEDED" in detail:
+                log.warning("[submit] concurrent limit: %s", detail)
                 raise BrainConcurrencyLimitError(
                     f"concurrent simulation limit exceeded: "
                     f"{detail or 'no detail'}"
                 )
+            log.warning("[submit] rate limited: %s", detail)
             raise BrainClientError(
                 f"submit rate limited (429): {detail or _safe_text(resp)}"
             )
 
         if resp.status_code not in (200, 201):
+            log.warning(
+                "[submit] HTTP %d: %s",
+                resp.status_code, _safe_text(resp),
+            )
             raise BrainClientError(
                 f"submit failed with HTTP {resp.status_code}: "
                 f"{_safe_text(resp)}"
@@ -384,18 +468,24 @@ class BrainClient:
 
         location = resp.header("Location")
         if not location:
+            log.warning("[submit] 201 without Location header")
             raise BrainProtocolError(
                 "submit response missing Location header"
             )
-        log.debug("[submit] %s -> %s", expression[:80], location)
+        log.debug("[submit] OK -> %s", location)
         return location
 
     def _poll(self, sim_url: str) -> SimulationResult:
         deadline = time.monotonic() + self._poll_timeout_seconds
         consecutive_errors = 0
+        last_progress: float | None = None
 
         for _ in range(self._max_polls):
             if time.monotonic() > deadline:
+                log.warning(
+                    "[poll] exceeded %.0fs timeout",
+                    self._poll_timeout_seconds,
+                )
                 raise BrainClientError(
                     f"poll exceeded {self._poll_timeout_seconds}s"
                 )
@@ -407,17 +497,18 @@ class BrainClient:
                 consecutive_errors = 0
             except TransportError:
                 consecutive_errors += 1
-                self._sleep_fn(self._backoff(consecutive_errors))
+                wait = self._backoff(consecutive_errors)
+                log.debug(
+                    "[poll] transport error, backoff %.1fs", wait,
+                )
+                self._sleep_fn(wait)
                 continue
 
             if resp.status_code == 401:
                 self._invalidate_auth()
+                log.warning("[poll] 401, invalidating auth")
                 raise BrainAuthError("poll rejected: not authenticated")
 
-            # 202 = accepted, not done. No body to parse; just wait.
-            # BRAIN observed in practice returns 200 + progress instead
-            # of 202, but the reference project still accepts 202 and
-            # the HTTP semantics ("accepted") fit our loop. See D-114.
             if resp.status_code == 202:
                 self._sleep_fn(self._next_poll_interval(resp))
                 continue
@@ -425,8 +516,17 @@ class BrainClient:
             if resp.status_code != 200:
                 if 500 <= resp.status_code < 600:
                     consecutive_errors += 1
-                    self._sleep_fn(self._backoff(consecutive_errors))
+                    wait = self._backoff(consecutive_errors)
+                    log.debug(
+                        "[poll] HTTP %d, backoff %.1fs",
+                        resp.status_code, wait,
+                    )
+                    self._sleep_fn(wait)
                     continue
+                log.warning(
+                    "[poll] HTTP %d: %s",
+                    resp.status_code, _safe_text(resp),
+                )
                 raise BrainClientError(
                     f"poll failed with HTTP {resp.status_code}: "
                     f"{_safe_text(resp)}"
@@ -435,6 +535,7 @@ class BrainClient:
             try:
                 data = resp.json()
             except ValueError as e:
+                log.warning("[poll] non-JSON body: %s", e)
                 raise BrainProtocolError(
                     f"poll returned non-JSON body: {e}"
                 ) from e
@@ -446,33 +547,34 @@ class BrainClient:
 
             status = data.get("status")
 
-            # ---- ERROR: terminal failure ----
             if status == "ERROR":
                 msg = (
                     data.get("message")
                     or data.get("error")
                     or "simulation ERROR"
                 )
+                log.warning("[poll] ERROR: %s", _truncate(str(msg), 100))
                 return SimulationResult(
                     alpha_id=None,
                     metrics=(),
                     error_message=str(msg),
                 )
 
-            # ---- WARNING: terminal if it carries a message (D-111) ----
             if status == "WARNING":
                 msg = data.get("message", "")
                 if msg:
+                    log.warning(
+                        "[poll] WARNING terminal: %s",
+                        _truncate(str(msg), 100),
+                    )
                     return SimulationResult(
                         alpha_id=None,
                         metrics=(),
                         error_message=str(msg),
                     )
-                # No message: treat as still-running and keep polling.
                 self._sleep_fn(self._next_poll_interval(resp))
                 continue
 
-            # ---- COMPLETE: fetch metrics in a second request (D-110) ----
             if status == "COMPLETE":
                 alpha_id = data.get("alpha")
                 if not isinstance(alpha_id, str) or not alpha_id:
@@ -482,13 +584,28 @@ class BrainClient:
                 log.debug("[poll] complete alpha=%s", alpha_id)
                 return self._fetch_alpha_metrics(alpha_id)
 
-            # ---- No status: {"progress": float}, keep waiting ----
+            # No status: {"progress": float}
+            progress = data.get("progress")
+            if progress is not None:
+                try:
+                    p = float(progress)
+                except (TypeError, ValueError):
+                    p = None
+                if p is not None and (
+                    last_progress is None or abs(p - last_progress) > 0.001
+                ):
+                    log.info("[poll] progress=%.0f%%", p * 100.0)
+                    last_progress = p
+
             self._sleep_fn(self._next_poll_interval(resp))
 
-        raise BrainClientError(f"poll exceeded {self._max_polls} attempts")
+        log.warning("[poll] exceeded %d attempts", self._max_polls)
+        raise BrainClientError(
+            f"poll exceeded {self._max_polls} attempts"
+        )
 
     def _fetch_alpha_metrics(self, alpha_id: str) -> SimulationResult:
-        """GET /alphas/{id} for the in-sample metrics block (D-110)."""
+        log.debug("[alpha] fetching %s", alpha_id)
         url = f"{_BASE_URL}/alphas/{alpha_id}"
         try:
             resp = self._transport.request(
@@ -531,14 +648,13 @@ class BrainClient:
             if isinstance(v, (int, float)):
                 metrics.append((str(k), float(v)))
 
-        log.debug("[alpha] %s metrics=%d", alpha_id, len(metrics))
+        log.debug("[alpha] %s got %d metrics", alpha_id, len(metrics))
         return SimulationResult(
             alpha_id=alpha_id,
             metrics=tuple(metrics),
         )
 
     def _next_poll_interval(self, resp: HttpResponse) -> float:
-        """Honor Retry-After; fall back to base_poll_interval."""
         raw = resp.header("Retry-After")
         if raw is None:
             return self._base_poll_interval
@@ -548,7 +664,6 @@ class BrainClient:
             return self._base_poll_interval
 
     def _backoff(self, attempt: int) -> float:
-        """Exponential backoff, capped so tests can't hang."""
         return min(self._base_poll_interval * (2 ** (attempt - 1)), 30.0)
 
 
@@ -566,10 +681,9 @@ def _extract_error_detail(resp: HttpResponse) -> str:
 
 
 def _safe_text(resp: HttpResponse) -> str:
-    """First 200 chars of the body, decoded leniently. Never raises."""
     try:
         return resp.body.decode("utf-8", errors="replace")[:200]
-    except Exception:  # noqa: BLE001 -- truly defensive
+    except Exception:  # noqa: BLE001
         return "<undecodable>"
 
 

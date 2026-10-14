@@ -11,7 +11,8 @@ Design decisions:
 - The loop ends on budget exhaustion, zero evaluated individuals, or
   reaching max_generations. See D-070.
 - Notifications are optional; the default is NullNotifier. See D-098.
-- Per-generation progress is logged at INFO. See D-115.
+- Per-generation progress is logged at INFO to the "wqgp.gp" channel.
+  See D-115 and D-132.
 - FAILED evaluations propagate to the Individual's status so the
   individual is not resubmitted. See D-125.
 """
@@ -52,7 +53,7 @@ from wqgp.selection import SelectionConfig, next_generation
 from wqgp.types import DataType
 
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("wqgp.gp")
 
 
 class CoordinatorError(RuntimeError):
@@ -61,16 +62,7 @@ class CoordinatorError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class RunConfig:
-    """Frozen, validated configuration for one GP run.
-
-    Invariants (enforced in __post_init__):
-      - run_id passes _ids.validate_run_id
-      - max_generations >= 1
-      - n_workers >= 1
-      - initial_population_size is None or >= 1
-      - builder_max_depth >= 0, builder_max_nodes >= 1
-      - crossover_max_depth >= 1, crossover_max_nodes >= 1
-    """
+    """Frozen, validated configuration for one GP run."""
     run_id: str
     pool: Pool
     budget: Budget
@@ -168,6 +160,13 @@ class Coordinator:
     def run(self) -> RunResult:
         pop, tracker, rng, start_gen = self._setup()
 
+        log.info(
+            "[%s] run starting: generation=%d population=%d "
+            "max_generations=%d",
+            self._config.run_id, start_gen, len(pop),
+            self._config.max_generations,
+        )
+
         executor = Executor(
             run_id=self._config.run_id,
             store=self._store,
@@ -259,8 +258,10 @@ class Coordinator:
                 generation += 1
                 self._save_checkpoint(pop, tracker, rng, generation)
         finally:
+            # Shut down workers inside the try/finally so an exception
+            # in the loop does not leak threads. The store is closed
+            # below, after _log_summary has had a chance to read it.
             executor.shutdown()
-            self._store.close()
 
         result = RunResult(
             generation=last_generation,
@@ -269,6 +270,13 @@ class Coordinator:
             budget_exhausted=budget_exhausted,
             stopped_reason=stopped_reason,
         )
+
+        try:
+            # _log_summary reads from the store; it must run while the
+            # store is still open. See D-133.
+            self._log_summary(result)
+        finally:
+            self._store.close()
 
         self._safe_notify(
             self._notifier.on_run_end,
@@ -291,6 +299,10 @@ class Coordinator:
         existing = self._ckpt_store.load_latest(self._config.run_id)
         if existing is None:
             return self._initial_setup()
+        log.info(
+            "[%s] resuming from checkpoint generation %d",
+            self._config.run_id, existing.generation,
+        )
         return self._resume_setup(existing)
 
     def _initial_setup(
@@ -396,8 +408,6 @@ class Coordinator:
         pop: Population,
         tracker: BudgetTracker,
     ) -> int:
-        """Submit every unevaluated, non-failed individual. Waits for
-        drain if any submission succeeded. Returns the submission count."""
         submitted = 0
         for ind in pop:
             if ind.is_evaluated():
@@ -418,13 +428,6 @@ class Coordinator:
         return submitted
 
     def _merge_evaluations(self, pop: Population) -> Population:
-        """Absorb evaluation results from the store into `pop`.
-
-        SUCCESS records attach fitness; FAILED records mark the
-        individual permanently failed so it is not resubmitted on the
-        next generation (see D-125). SKIPPED and unknown statuses leave
-        the individual unchanged, allowing a future retry.
-        """
         updated: list[Individual] = []
         for ind in pop:
             if ind.is_evaluated():
@@ -448,7 +451,6 @@ class Coordinator:
             if rec.status is EvaluationStatus.FAILED:
                 updated.append(ind.with_status(EvaluationStatus.FAILED))
                 continue
-            # SKIPPED or other: leave unchanged for a possible retry.
             updated.append(ind)
         return Population(updated)
 
@@ -462,6 +464,32 @@ class Coordinator:
             if best is None or ind.fitness > best:
                 best = ind.fitness
         return best
+
+    def _log_summary(self, result: RunResult) -> None:
+        """Print a run-end summary: reason, rates, top 3 by fitness."""
+        rid = self._config.run_id
+        counts = self._store.count_by_status(rid)
+        success = counts.get("SUCCESS", 0)
+        failed = counts.get("FAILED", 0)
+        total = success + failed
+        rate = (success / total * 100.0) if total else 0.0
+
+        log.info(
+            "[%s] run finished: reason=%s generations=%d "
+            "total_sims=%d success=%d failed=%d rate=%.1f%%",
+            rid, result.stopped_reason, result.generation,
+            result.total_simulations_used, success, failed, rate,
+        )
+
+        top = self._store.top_by_fitness(rid, 3)
+        for i, rec in enumerate(top, start=1):
+            to = dict(rec.metrics).get("turnover")
+            to_str = f"{to:.4f}" if to is not None else "?"
+            expr = _truncate(rec.expression, 100)
+            log.info(
+                "[%s]   top %d: sharpe=%.4f turnover=%s expr=%s",
+                rid, i, rec.fitness, to_str, expr,
+            )
 
     def _safe_notify(self, fn, event) -> None:
         """Call a notifier method. Swallows everything (D-095)."""
@@ -492,3 +520,10 @@ class Coordinator:
             note=f"start of generation {generation}",
         )
         self._ckpt_store.save(ckpt)
+
+
+def _truncate(s: str, n: int) -> str:
+    s = s.replace("\n", " ").replace("\r", " ")
+    if len(s) <= n:
+        return s
+    return s[: n - 3] + "..."

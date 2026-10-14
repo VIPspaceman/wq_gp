@@ -3317,3 +3317,92 @@ front case. Then it should assert `crowding == math.inf` directly,
 not `isfinite`. That is a different test with a different name.
 
 ---
+
+---
+
+## D-132 — Logging is grouped into per-file channels
+
+**Decision**: log statements are grouped into named "channels". A
+channel name that is not already a dotted logger name gets the prefix
+`wqgp.`. So `"brain"` resolves to the logger `wqgp.brain`, and
+`"wqgp.brain.client"` is used verbatim. Each channel can be
+independently set to DEBUG/INFO/WARNING/ERROR/CRITICAL/OFF in the
+config.
+
+Channels defined so far:
+
+- `brain` — `brain/client.py` (login, submit, poll, result)
+- `gp` — `coordinator.py` (run lifecycle, per-generation, summary)
+- `pool` — `brain/pool_builder.py` (fetch progress)
+- `execution` — `execution.py` (worker-level; default OFF)
+- `storage` — `persistence.py` and `checkpoint.py`
+- `notification` — `notification/telegram.py`
+- `cli` — `cli.py`
+
+**Why**: the earlier `components` design (D-119) required users to
+write full logger names, which meant knowing the module layout. That
+is a leaky abstraction: the user's mental model is "the BRAIN client"
+or "the GP loop", not "wqgp.brain.client". A short channel name
+matches how a user thinks about the system, and the mapping to the
+underlying logger is one line of code.
+
+Channels are organized one-per-file rather than one-per-logical-topic
+for the same reason: when a user opens `brain/client.py` to add a log
+statement, they do not want to decide whether it belongs to "submit"
+or "poll" or "result". The file defines the channel. If the file grows
+enough to warrant splitting, the channel splits with it.
+
+The `components` field is retained as a legacy alias so existing
+config files keep working. When both are present, `channels` wins on
+a per-key basis.
+
+`OFF` is a valid channel level. It maps to `logging.CRITICAL + 10`, a
+value no record will reach, so any logger set to it drops everything.
+This is cleaner than removing the channel from the hierarchy (which
+would leave the child loggers inheriting from the root, defeating the
+intent).
+
+Default channel levels:
+
+- `brain`, `gp`, `pool`, `cli` → INFO (progress visible by default)
+- `execution`, `storage`, `notification` → WARNING or OFF
+
+The default for `execution` is OFF because per-worker logs are
+extremely noisy: 200 simulations × several internal steps = thousands
+of lines. The result of each simulation is already logged at the
+`brain` channel, which is where the user wants to see it.
+
+**Revisit if**: a channel is used by two files (e.g. `storage` spans
+`persistence.py` and `checkpoint.py`). Today both emit few logs and
+grouping them is fine. If one file's logs become much louder than the
+other, split into two channels.
+
+---
+
+---
+
+## D-133 — Store must be open when run-end summary is logged
+
+**Decision**: `Coordinator.run()` shuts down the executor in the first
+`finally`, then builds the `RunResult`, then calls `_log_summary`
+while the store is still open, and only then closes the store in a
+second `finally`.
+
+**Why**: the earlier refactor added a run-end summary that reads
+`count_by_status` and `top_by_fitness` from the `EvaluationStore`.
+The store was closed in the same `finally` that shut down the
+executor, before `_log_summary` ran. Every test that touched a real
+coordinator run failed with `sqlite3.ProgrammingError: Cannot operate
+on a closed database`.
+
+The fix is ordering, not logic: close the store last. The two-phase
+`finally` structure (executor first, store second) also means an
+exception during the loop still shuts down workers, and an exception
+during `_log_summary` still closes the store.
+
+**Revisit if**: the coordinator gains a second reader of the store
+after the run ends (e.g. a post-run "submit best alpha" step). Then
+move the store's close into a context manager around `run()`, and
+let all readers run inside that scope.
+
+---
