@@ -32,5 +32,11 @@
     "seed": 42,
     "max_generations": 10,
     "checkpoint_root": "./checkpoints"
+  },
+
+  "cache": {
+    "enabled": true,
+    "ttl_days": 90,
+    "path": null
   }
 }

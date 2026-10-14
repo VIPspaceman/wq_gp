@@ -35131,6 +35131,42 @@
       }
     },
     {
+      "name": "ts_av_diff",
+      "input_types": [
+        "MATRIX"
+      ],
+      "output_type": "MATRIX",
+      "param_domains": {
+        "d": {
+          "kind": "INT_RANGE",
+          "min_value": 1,
+          "max_value": 512,
+          "default": 20
+        }
+      }
+    },
+    {
+      "name": "ts_backfill",
+      "input_types": [
+        "MATRIX"
+      ],
+      "output_type": "MATRIX",
+      "param_domains": {
+        "lookback": {
+          "kind": "INT_RANGE",
+          "min_value": 1,
+          "max_value": 512,
+          "default": 120
+        },
+        "k": {
+          "kind": "INT_RANGE",
+          "min_value": 1,
+          "max_value": 10,
+          "default": 1
+        }
+      }
+    },
+    {
       "name": "ts_decay_linear",
       "input_types": [
         "MATRIX"

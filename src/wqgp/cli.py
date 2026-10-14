@@ -16,6 +16,8 @@ Design decisions:
 - `--settings` and `--run-config` split the two loader roles.
   `--config` remains as a backward-compatible alias for both.
   See D-136.
+- `cache` subcommand inspects and manages the cross-run evaluation
+  cache. See D-138.
 """
 from __future__ import annotations
 
@@ -105,7 +107,7 @@ def _resolve_settings_path(args: argparse.Namespace) -> Path | None:
 
 
 def _load_settings(args: argparse.Namespace) -> Settings:
-    """Load the settings file, if given. Apply --log-level override."""
+    """Load the settings file, if given. Apply --log-level / --log-file."""
     path = _resolve_settings_path(args)
     try:
         settings = Settings.load(path)
@@ -132,6 +134,7 @@ def _load_settings(args: argparse.Namespace) -> Settings:
             ),
             defaults=settings.defaults,
             credentials=settings.credentials,
+            cache=settings.cache,
             raw=settings.raw,
         )
 
@@ -146,6 +149,7 @@ def _load_settings(args: argparse.Namespace) -> Settings:
             ),
             defaults=settings.defaults,
             credentials=settings.credentials,
+            cache=settings.cache,
             raw=settings.raw,
         )
 
@@ -156,8 +160,7 @@ def _resolve_credentials(settings: Settings) -> BrainCredentials:
     """Resolve BRAIN credentials.
 
     Precedence: env vars > config file > error. Env vars win because
-    they are the safer channel; a user who sets both is presumed to
-    want the env value to apply. See D-089 and D-135.
+    they are the safer channel. See D-089 and D-135.
     """
     try:
         return BrainCredentials.from_env()
@@ -310,7 +313,7 @@ def _add_path_flags(p: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "path to the settings file (logging / defaults / "
-            "credentials). Overrides --config for those blocks."
+            "credentials / cache). Overrides --config for those blocks."
         ),
     )
     p.add_argument(
@@ -360,6 +363,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
+    # --- build-pool ---
     p_bp = sub.add_parser(
         "build-pool",
         parents=[common],
@@ -399,6 +403,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_settings_flags(p_bp)
     p_bp.set_defaults(handler=_cmd_build_pool)
 
+    # --- run ---
     p_run = sub.add_parser(
         "run",
         parents=[common],
@@ -450,6 +455,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_run.set_defaults(handler=_cmd_run)
 
+    # --- signatures ---
     p_sig = sub.add_parser(
         "signatures",
         parents=[common],
@@ -477,6 +483,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_sig.set_defaults(handler=_cmd_signatures)
 
+    # --- list-runs ---
     p_lr = sub.add_parser(
         "list-runs",
         parents=[common],
@@ -487,6 +494,65 @@ def _build_parser() -> argparse.ArgumentParser:
         help="checkpoint root (default: ./checkpoints)",
     )
     p_lr.set_defaults(handler=_cmd_list_runs)
+
+    # --- cache ---
+    p_cache = sub.add_parser(
+        "cache",
+        parents=[common],
+        help="inspect and manage the cross-run evaluation cache",
+    )
+    cache_sub = p_cache.add_subparsers(
+        dest="cache_command", metavar="CACHE_COMMAND"
+    )
+
+    p_cs = cache_sub.add_parser(
+        "stats",
+        help="print cache size, hit count, and age of entries",
+    )
+    p_cs.add_argument(
+        "--cache-path", default=None,
+        help="override the cache DB path",
+    )
+    p_cs.add_argument(
+        "--settings", default=None,
+        help="path to the settings file (for cache.ttl_days)",
+    )
+    p_cs.add_argument(
+        "--config", default=None,
+        help="alias for --settings",
+    )
+    p_cs.set_defaults(handler=_cmd_cache_stats)
+
+    p_cc = cache_sub.add_parser(
+        "clear",
+        help="delete cached entries",
+    )
+    p_cc.add_argument(
+        "--cache-path", default=None,
+        help="override the cache DB path",
+    )
+    p_cc.add_argument(
+        "--before", default=None,
+        help=(
+            "only delete entries created before this date "
+            "(YYYY-MM-DD). Without it, clears everything."
+        ),
+    )
+    p_cc.add_argument(
+        "--yes", action="store_true",
+        help="skip the confirmation prompt",
+    )
+    p_cc.add_argument(
+        "--settings", default=None,
+        help="path to the settings file",
+    )
+    p_cc.add_argument(
+        "--config", default=None,
+        help="alias for --settings",
+    )
+    p_cc.set_defaults(handler=_cmd_cache_clear)
+
+    p_cache.set_defaults(handler=_cmd_cache_help)
 
     return parser
 
@@ -557,7 +623,7 @@ def _make_notifier(args: argparse.Namespace) -> Notifier:
     return TelegramNotifier(credentials=creds, transport=transport)
 
 
-# --- commands ---------------------------------------------------------------
+# --- commands: build-pool ---------------------------------------------------
 
 def _cmd_build_pool(args: argparse.Namespace) -> int:
     sig_path = Path(args.signatures)
@@ -602,6 +668,8 @@ def _cmd_build_pool(args: argparse.Namespace) -> int:
         log.info("  %s: %s", k, v)
     return EXIT_OK
 
+
+# --- commands: run ----------------------------------------------------------
 
 def _resolve_budget(
     args: argparse.Namespace, cfg: dict[str, Any]
@@ -774,6 +842,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --- commands: signatures ---------------------------------------------------
+
 def _cmd_signatures(args: argparse.Namespace) -> int:
     sig_path = Path(args.signatures)
     try:
@@ -841,6 +911,8 @@ def _print_audit(audit: SignatureAudit, *, max_suggestions: int) -> None:
         )
 
 
+# --- commands: list-runs ----------------------------------------------------
+
 def _cmd_list_runs(args: argparse.Namespace) -> int:
     root = Path(args.checkpoint_root)
     if not root.exists():
@@ -862,6 +934,122 @@ def _cmd_list_runs(args: argparse.Namespace) -> int:
         except CorruptCheckpointError:
             gen = "corrupt"
         print(f"{run_id:<30} {gen:>12}")
+    return EXIT_OK
+
+
+# --- commands: cache --------------------------------------------------------
+
+def _resolve_cache_path(
+    args: argparse.Namespace,
+    settings: Settings,
+) -> Path:
+    """Pick the cache DB path.
+
+    Priority: --cache-path flag > settings.cache.path >
+    <checkpoint_root>/cache.db. The last fallback keeps the cache next
+    to the run DBs, which is what most users will want.
+    """
+    override = getattr(args, "cache_path", None)
+    if override:
+        return Path(override)
+    if settings.cache.path:
+        return Path(settings.cache.path)
+    checkpoint_root = Path(settings.defaults.checkpoint_root)
+    return checkpoint_root / "cache.db"
+
+
+def _cmd_cache_help(args: argparse.Namespace) -> int:
+    print("usage: wqgp cache {stats,clear}", file=sys.stderr)
+    print()
+    print("  stats   print cache size, hit count, and age")
+    print("  clear   delete cached entries")
+    return EXIT_USAGE
+
+
+def _cmd_cache_stats(args: argparse.Namespace) -> int:
+    from wqgp.cache import EvaluationCache
+
+    settings = args._settings
+    path = _resolve_cache_path(args, settings)
+
+    if not path.exists():
+        print(f"no cache DB at {path}")
+        print("(it will be created on the next run)")
+        return EXIT_OK
+
+    cache = EvaluationCache(path, ttl_days=settings.cache.ttl_days)
+    try:
+        s = cache.stats()
+    finally:
+        cache.close()
+
+    print(f"cache DB:  {path}")
+    print(f"ttl:       {settings.cache.ttl_days} days")
+    print()
+    print(f"total entries:   {s.total_entries}")
+    print(f"  success:       {s.success_entries}")
+    print(f"  failed:        {s.failed_entries}")
+    print(f"  expired:       {s.expired_entries}")
+    print()
+    print(f"total hits:      {s.total_hits}")
+    print(f"avg hits/entry:  {s.avg_hits_per_entry:.2f}")
+    print()
+    if s.oldest_created_at is not None:
+        import datetime as _dt
+        oldest = _dt.datetime.fromtimestamp(s.oldest_created_at)
+        newest = _dt.datetime.fromtimestamp(s.newest_created_at)
+        print(f"oldest entry:    {oldest.isoformat(timespec='seconds')}")
+        print(f"newest entry:    {newest.isoformat(timespec='seconds')}")
+    return EXIT_OK
+
+
+def _cmd_cache_clear(args: argparse.Namespace) -> int:
+    from wqgp.cache import EvaluationCache
+
+    settings = args._settings
+    path = _resolve_cache_path(args, settings)
+
+    if not path.exists():
+        print(f"no cache DB at {path}", file=sys.stderr)
+        return EXIT_OK
+
+    before_ts: float | None = None
+    if args.before is not None:
+        import datetime as _dt
+        try:
+            dt = _dt.datetime.strptime(args.before, "%Y-%m-%d")
+        except ValueError:
+            raise CliError(
+                f"--before must be YYYY-MM-DD, got {args.before!r}"
+            )
+        before_ts = dt.timestamp()
+
+    if not args.yes:
+        if before_ts is None:
+            prompt = f"Delete ALL entries in {path}? [y/N] "
+        else:
+            prompt = (
+                f"Delete entries older than {args.before} in "
+                f"{path}? [y/N] "
+            )
+        answer = input(prompt).strip().lower()
+        if answer not in ("y", "yes"):
+            print("aborted")
+            return EXIT_OK
+
+    cache = EvaluationCache(path, ttl_days=settings.cache.ttl_days)
+    try:
+        removed = cache.clear(before_ts=before_ts)
+    finally:
+        cache.close()
+
+    if before_ts is None:
+        print(f"deleted {removed} entries from {path}")
+    else:
+        print(
+            f"deleted {removed} entries older than "
+            f"{args.before} from {path}"
+        )
     return EXIT_OK
 
 

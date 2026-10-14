@@ -1,15 +1,20 @@
-# Python 缓存
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Secrets
+wqgp.json
 
-# 虚拟环境
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
-env/
 
-# 其他常用
-*.log
-*.tmp
-wqgp.json
+# Project artifacts
+checkpoints/
+logs/
+*.db
+*.db-wal
+*.db-shm
+pool.json
+
+# Reference data (regeneratable from BRAIN API)
+data/

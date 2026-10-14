@@ -110,6 +110,48 @@ class DefaultsSettings:
         return cls(**kwargs)
 
 
+# --- cache -----------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class CacheSettings:
+    """Cross-run evaluation cache configuration.
+
+    - enabled: master switch. False = never read or write the cache.
+    - ttl_days: entries older than this are ignored on read. Not
+      deleted; use `wqgp cache clear` to remove. See D-143.
+    - path: location of the cache DB. None = <checkpoint_root>/cache.db,
+      resolved at use time.
+    """
+    enabled: bool = True
+    ttl_days: int = 90
+    path: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("cache.enabled must be a bool")
+        if not isinstance(self.ttl_days, int) or isinstance(
+            self.ttl_days, bool
+        ):
+            raise ValueError("cache.ttl_days must be an int")
+        if self.ttl_days < 1:
+            raise ValueError("cache.ttl_days must be >= 1")
+        if self.path is not None and not isinstance(self.path, str):
+            raise ValueError("cache.path must be a string or null")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CacheSettings":
+        if not isinstance(data, dict):
+            raise ValueError("cache config must be an object")
+        known = {"enabled", "ttl_days", "path"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown cache keys: {sorted(unknown)}")
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            ttl_days=int(data.get("ttl_days", 90)),
+            path=data.get("path"),
+        )
+
 # --- top-level --------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +168,7 @@ class Settings:
     credentials: CredentialsSettings = field(
         default_factory=CredentialsSettings
     )
+    cache: CacheSettings = field(default_factory=CacheSettings)
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -140,11 +183,13 @@ class Settings:
         logging_block = data.get("logging", {})
         defaults_block = data.get("defaults", {})
         credentials_block = data.get("credentials", {})
-
+        cache_block = data.get("cache", {})
+        
         return cls(
             logging=LoggingSettings.from_dict(logging_block),
             defaults=DefaultsSettings.from_dict(defaults_block),
             credentials=CredentialsSettings.from_dict(credentials_block),
+            cache=CacheSettings.from_dict(cache_block),
             raw=dict(data),
         )
 

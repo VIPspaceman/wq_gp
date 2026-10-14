@@ -3563,3 +3563,211 @@ the JSON schema to a "best-effort" checker; the whole point is that
 editors enforce it exactly.
 
 ---
+
+---
+
+## D-138 — EvaluationConfig is the single source of truth
+
+**Decision**: a new module `evaluation_config.py` defines
+`EvaluationConfig`, a frozen wrapper around `BrainSettings`. The
+Coordinator (in a future round) holds one `EvaluationConfig` per run
+and passes it, unchanged, to two consumers: the cache layer (for key
+generation) and the BrainClient (for request construction).
+
+**Why**: this is the highest-value insight from the external review.
+If the cache key is computed from one set of settings and the BRAIN
+request is built from another — say, because a later refactor forgets
+to thread one parameter through — the cache can silently serve the
+wrong result. This is the "silent wrong answer" class of bug, the
+worst kind for a research tool.
+
+`EvaluationConfig.to_api_dict()` delegates to `BrainSettings` so there
+is exactly one place that knows the field names BRAIN expects.
+`settings_hash()` is computed over the output of `to_api_dict()`, so
+if the API dict ever gains a field, the hash changes automatically
+and old cache entries stop matching. That is the desired behavior.
+
+To avoid a circular import when `BrainClient` starts accepting an
+`EvaluationConfig` in Round 2, `BrainSettings` moves from
+`brain/client.py` to a new `brain/settings.py`. `brain/client.py`
+re-exports it, so existing imports keep working.
+
+**Revisit if**: a second settings class appears that can also drive a
+simulation. Then this class becomes an ABC or a Protocol, and concrete
+settings implement it. Do NOT add settings subclasses before that
+need appears.
+
+---
+
+## D-139 — settings_hash is canonicalized JSON, SHA-256
+
+**Decision**: `EvaluationConfig.settings_hash()` serializes the API
+dict with `json.dumps(..., sort_keys=True, separators=(",", ":"))`
+and returns the SHA-256 hex digest.
+
+**Why**: determinism requires controlling every source of variance:
+
+- `sort_keys=True`: field order must not leak into the hash.
+- `separators=(",", ":")`: default separators include spaces after
+  `:` and `,`, so the same dict serialized via two code paths with
+  different `json.dumps` defaults would hash differently.
+- `to_api_dict()`: uses BRAIN's own field names and value types. If
+  we hashed `BrainSettings.__dict__` directly, the hash would change
+  whenever we renamed a Python attribute, invalidating the entire
+  cache for a cosmetic reason.
+
+SHA-256 because it is what the AST fingerprint uses, and consistency
+matters more than the theoretical hash strength for this use.
+
+**Revisit if**: a field appears whose JSON representation is not
+stable across Python versions or platforms (e.g. a `float` that
+serializes differently on different libm). Then that field gets an
+explicit canonicalizer. Do NOT switch to `pickle` or `repr`; both are
+unstable.
+
+---
+
+## D-140 — cache_key = SHA-256 of version + fingerprint + settings_hash
+
+**Decision**: `EvaluationConfig.cache_key(fingerprint)` returns
+`SHA-256("{CACHE_SCHEMA_VERSION}:{fingerprint}:{settings_hash}")` as
+hex. `CACHE_SCHEMA_VERSION` is a module-level integer constant,
+currently 1.
+
+**Why**: the version prefix lets us change how the key is computed
+without colliding with old keys. Bump it when:
+
+- the delimiter between components changes
+- the settings hash stops being the SHA-256 of the API dict
+- the fingerprint algorithm changes
+
+Old keys remain in the cache DB and simply never match again. They
+expire naturally via the TTL. There is no migration step.
+
+The cache DB's `PRAGMA user_version` and `CACHE_SCHEMA_VERSION` are
+kept in sync. A DB whose user_version does not match raises
+`IncompatibleCacheSchemaError` at open time, so we never read a cache
+created by an incompatible key scheme.
+
+**Revisit if**: we need to support multiple schema versions
+simultaneously (e.g. read old and write new during a migration
+window). Then the version becomes a column and reads filter on a
+range. Do NOT hardcode two versions in the key format.
+
+---
+
+## D-141 — Cache is a separate SQLite file from run DBs
+
+**Decision**: `EvaluationCache` opens its own SQLite file. Default
+path is `<checkpoint_root>/cache.db`. Run DBs stay where they are
+and are not merged.
+
+**Why**: three forces.
+
+1. **Different lifetimes.** A run DB is an experiment record; it is
+   never deleted. A cache entry has a TTL and can be cleared. Mixing
+   them into one file means a cache clear could delete experiment
+   records.
+
+2. **Different access patterns.** A run DB is written by one process
+   at a time and read by user scripts. A cache is read before every
+   submission and written after every completion. Separating them
+   keeps lock contention off the user-facing DB.
+
+3. **Different schemas.** A cache row is keyed by
+   `(fingerprint, settings)` and remembers `hit_count`. A run row is
+   keyed by `(run_id, fingerprint)` and remembers `generation`. The
+   two have almost no columns in common once you get past the status
+   fields.
+
+The alternative — "one global DB with a run_id column" — was the
+original AI recommendation in one of the two reviews. It was rejected
+because migrating the existing per-run DBs is high-risk for no
+functional gain.
+
+**Revisit if**: we ever need a cross-run query that joins cache and
+run records (e.g. "for every fingerprint in the cache, which runs
+used it?"). Then a materialized view or a small join table is
+justified. Do NOT merge the DBs.
+
+---
+
+## D-142 — Only reusable results are written to the cache
+
+**Decision**: `EvaluationCache.put` accepts entries with
+`status=SUCCESS` or `status=FAILED, error_type=PERMANENT`. Nothing
+else is cached.
+
+Specifically NOT cached:
+
+- Transient failures: network timeouts, HTTP 5xx, 429 rate limits,
+  auth failures, concurrency-limit hits.
+- SKIPPED results (budget exhausted before submission).
+- A `TaskResult` without a finite fitness.
+
+**Why**: caching a transient failure would permanently block a
+perfectly good expression. The single most dangerous case is a
+timeout: the request may have been accepted by BRAIN, the simulation
+may be running, and the client just did not wait long enough. If that
+timeout is cached as a failure, the expression is never re-evaluated.
+
+The error_type column carries `PERMANENT` for the cached failure
+case. `TRANSIENT` is not a member of `ErrorType` because transient
+failures never reach the cache; making that impossible at the type
+level is clearer than documenting "do not use TRANSIENT here".
+
+**Revisit if**: a class of failures appears that is permanent *for
+this account* but not in general (e.g. "region not available for your
+tier"). Then `error_type` gains `ACCOUNT_SPECIFIC`, and the cache key
+gains an account identifier. That is a larger change; do not
+short-circuit it by reusing PERMANENT.
+
+---
+
+## D-143 — TTL is a soft expiry; entries are not auto-deleted
+
+**Decision**: an entry older than `ttl_days` is ignored on `get()` but
+remains in the DB until an explicit `clear()` call.
+
+**Why**: two benefits.
+
+1. **Auditability.** After a TTL expiry and re-evaluation, we can
+   compare the old and new values to detect metric drift. If the old
+   row had been deleted, that comparison is impossible.
+
+2. **No background threads.** Soft expiry means there is no cleanup
+   task to schedule, no race between cleanup and a concurrent run,
+   and no "the cache DB grew because the process never called clear"
+   class of bug.
+
+The cost is disk space: expired entries accumulate until the user
+runs `wqgp cache clear --before <date>`. A run of 200 simulations
+produces at most 200 cache rows; the DB stays tiny for years.
+
+**Revisit if**: a cache DB exceeds a few hundred MB. Then an
+automatic vacuum-on-open step, or a size-based trigger, is justified.
+Do NOT delete on read; that destroys the audit trail.
+
+---
+
+## D-144 — Concurrency columns are reserved but unused
+
+**Decision**: the cache table has `in_flight` and `in_flight_since`
+columns. They are always 0 and NULL in this round. No code reads or
+writes them.
+
+**Why**: the external review identified a real failure mode for
+concurrent runs: two processes both miss the cache for the same key
+and both submit to BRAIN, wasting one simulation. The fix is an
+atomic claim (set `in_flight=1`, submit, on completion clear it and
+write the result). That fix belongs in a later round when the
+Coordinator actually consults the cache.
+
+Reserving the columns now means the later round does not need a table
+migration. The alternative — add the columns when needed — means a
+`PRAGMA user_version` bump and a migration path for users with an
+existing cache. Neither is hard, but neither is necessary either.
+
+**Revisit if**: single-process runs turn out to be the only mode we
+ever use. Then the columns can be dropped in a later schema version
+bump. Until then, dead columns are cheaper than a migration.

@@ -41,6 +41,7 @@ from wqgp.brain.transport import (
     RequestsTransport,
     TransportError,
 )
+from wqgp.brain.settings import BrainSettings
 from wqgp.execution import Task, TaskResult, TaskStatus
 
 
@@ -90,62 +91,62 @@ class BrainCredentials:
         return cls(username=user, password=pwd)
 
 
-@dataclass(frozen=True, slots=True)
-class BrainSettings:
-    """Frozen simulation settings.
+# @dataclass(frozen=True, slots=True)
+# class BrainSettings:
+#     """Frozen simulation settings.
 
-    Defaults (decay=4, neutralization="INDUSTRY") match values observed
-    to be accepted by BRAIN's /simulations endpoint for a TUTORIAL
-    account. See D-113.
-    """
-    instrument_type: str = "EQUITY"
-    region: str = "USA"
-    universe: str = "TOP3000"
-    delay: int = 1
-    decay: int = 4
-    neutralization: str = "INDUSTRY"
-    truncation: float = 0.08
-    pasteurization: str = "ON"
-    nan_handling: str = "OFF"
-    unit_handling: str = "VERIFY"
-    language: str = "FASTEXPR"
-    visualization: bool = False
-    test_period: str = "P0Y0M"
+#     Defaults (decay=4, neutralization="INDUSTRY") match values observed
+#     to be accepted by BRAIN's /simulations endpoint for a TUTORIAL
+#     account. See D-113.
+#     """
+#     instrument_type: str = "EQUITY"
+#     region: str = "USA"
+#     universe: str = "TOP3000"
+#     delay: int = 1
+#     decay: int = 4
+#     neutralization: str = "INDUSTRY"
+#     truncation: float = 0.08
+#     pasteurization: str = "ON"
+#     nan_handling: str = "OFF"
+#     unit_handling: str = "VERIFY"
+#     language: str = "FASTEXPR"
+#     visualization: bool = False
+#     test_period: str = "P0Y0M"
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.delay, int) or isinstance(self.delay, bool):
-            raise ValueError("delay must be an int")
-        if self.delay < 0:
-            raise ValueError("delay must be >= 0")
-        if not isinstance(self.decay, int) or isinstance(self.decay, bool):
-            raise ValueError("decay must be an int")
-        if self.decay < 0:
-            raise ValueError("decay must be >= 0")
-        if not isinstance(self.truncation, (int, float)) or isinstance(
-            self.truncation, bool
-        ):
-            raise ValueError("truncation must be a number")
-        if not 0.0 <= float(self.truncation) <= 1.0:
-            raise ValueError("truncation must be in [0.0, 1.0]")
-        if not isinstance(self.visualization, bool):
-            raise ValueError("visualization must be a bool")
+#     def __post_init__(self) -> None:
+#         if not isinstance(self.delay, int) or isinstance(self.delay, bool):
+#             raise ValueError("delay must be an int")
+#         if self.delay < 0:
+#             raise ValueError("delay must be >= 0")
+#         if not isinstance(self.decay, int) or isinstance(self.decay, bool):
+#             raise ValueError("decay must be an int")
+#         if self.decay < 0:
+#             raise ValueError("decay must be >= 0")
+#         if not isinstance(self.truncation, (int, float)) or isinstance(
+#             self.truncation, bool
+#         ):
+#             raise ValueError("truncation must be a number")
+#         if not 0.0 <= float(self.truncation) <= 1.0:
+#             raise ValueError("truncation must be in [0.0, 1.0]")
+#         if not isinstance(self.visualization, bool):
+#             raise ValueError("visualization must be a bool")
 
-    def to_api_dict(self) -> dict[str, Any]:
-        return {
-            "instrumentType": self.instrument_type,
-            "region": self.region,
-            "universe": self.universe,
-            "delay": self.delay,
-            "decay": self.decay,
-            "neutralization": self.neutralization,
-            "truncation": float(self.truncation),
-            "pasteurization": self.pasteurization,
-            "nanHandling": self.nan_handling,
-            "unitHandling": self.unit_handling,
-            "language": self.language,
-            "visualization": self.visualization,
-            "testPeriod": self.test_period,
-        }
+#     def to_api_dict(self) -> dict[str, Any]:
+#         return {
+#             "instrumentType": self.instrument_type,
+#             "region": self.region,
+#             "universe": self.universe,
+#             "delay": self.delay,
+#             "decay": self.decay,
+#             "neutralization": self.neutralization,
+#             "truncation": float(self.truncation),
+#             "pasteurization": self.pasteurization,
+#             "nanHandling": self.nan_handling,
+#             "unitHandling": self.unit_handling,
+#             "language": self.language,
+#             "visualization": self.visualization,
+#             "testPeriod": self.test_period,
+#         }
 
 
 # --- fitness -----------------------------------------------------------------

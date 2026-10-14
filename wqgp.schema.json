@@ -64,6 +64,15 @@
         "max_breeding_attempts": { "type": "integer", "minimum": 1 },
         "checkpoint_root": { "type": "string" }
       }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ttl_days": { "type": "integer", "minimum": 1 },
+        "path": { "type": ["string", "null"] }
+      }
     }
   }
 }
