@@ -1,22 +1,17 @@
 """Command-line interface for wqgp.
 
 Design decisions:
-- Subparsers via argparse; zero runtime dependency. See D-087.
-- Config is JSON, overridden by flags; precedence flag > config > default.
-  See D-088.
-- Secrets come ONLY from environment variables. Never from config files
-  or CLI flags. See D-089.
-- SIGINT propagates out of main(); the Coordinator's finally block
-  performs cleanup. Exit code 130. See D-090.
-- Structured logging to stderr; --log-level controls verbosity. See D-091.
-- --dry-run uses a deterministic evaluator (SHA-256 of the fingerprint),
-  so end-to-end CLI tests need no network. See D-092.
-- --telegram opts into Telegram notifications; credentials come from
-  the environment. See D-097.
-- `signatures` subcommand audits a signature table; it never writes
-  the file. See D-102.
-- `build-pool` accepts simulation settings flags; /data-fields needs
-  them. See D-107.
+- Subparsers via argparse. See D-087.
+- Config is JSON, flag > config > default. See D-088.
+- Secrets come ONLY from environment variables. See D-089.
+- SIGINT propagates; exit code 130. See D-090.
+- Structured logging to stderr; --log-level controls verbosity. See
+  D-091.
+- --dry-run uses a deterministic evaluator. See D-092.
+- --telegram opts into Telegram notifications. See D-097.
+- `signatures` audits a signature table; never writes it. See D-102.
+- `build-pool` accepts simulation settings flags. See D-107.
+- Logs go to the "wqgp.cli" channel. See D-134.
 """
 from __future__ import annotations
 
@@ -46,6 +41,7 @@ from wqgp.budget import Budget
 from wqgp.checkpoint import CheckpointStore, CorruptCheckpointError
 from wqgp.coordinator import Coordinator, CoordinatorError, RunConfig
 from wqgp.execution import Evaluator, Task, TaskResult, TaskStatus
+from wqgp.logging_setup import LoggingSettings, setup_logging
 from wqgp.notification.null import NullNotifier
 from wqgp.notification.protocol import Notifier
 from wqgp.notification.telegram import (
@@ -53,7 +49,6 @@ from wqgp.notification.telegram import (
     TelegramCredentials,
     TelegramNotifier,
 )
-from wqgp.logging_setup import LoggingSettings, setup_logging
 from wqgp.pool import Pool, PoolError
 from wqgp.selection import SelectionConfig
 from wqgp.serialization import SerializationError
@@ -65,7 +60,7 @@ from wqgp.signatures_audit import (
 )
 
 
-log = logging.getLogger("wqgp")
+log = logging.getLogger("wqgp.cli")
 
 
 # --- exit codes -------------------------------------------------------------
@@ -79,8 +74,7 @@ EXIT_INTERRUPTED = 130
 # --- user-facing error ------------------------------------------------------
 
 class CliError(RuntimeError):
-    """Raised for expected user-facing errors. main() catches it and
-    converts to an exit code with a clean log message."""
+    """Raised for expected user-facing errors."""
 
 
 # --- logging ---------------------------------------------------------------
@@ -91,12 +85,7 @@ _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 def _load_settings(args: argparse.Namespace) -> Settings:
     """Load the settings file, if --config was given.
 
-    The `--log-level` flag overrides the file's logging.level.
-
-    `--config` is defined only on the `run` subcommand; other
-    subcommands (build-pool, list-runs, signatures) do not accept it.
-    We read it via getattr so those subcommands work unchanged.
-    See D-120.
+    --config is defined only on the `run` subcommand. See D-120.
     """
     config_path = getattr(args, "config", None)
     try:
@@ -106,12 +95,11 @@ def _load_settings(args: argparse.Namespace) -> Settings:
 
     log_level = getattr(args, "log_level", None)
     if log_level is not None:
-        # Rebuild logging block with the flag's level.
         settings = Settings(
             logging=LoggingSettings(
                 level=log_level,
                 style=settings.logging.style,
-                components=settings.logging.components,
+                channels=settings.logging.channels,
                 file=settings.logging.file,
             ),
             defaults=settings.defaults,
@@ -123,8 +111,7 @@ def _load_settings(args: argparse.Namespace) -> Settings:
 # --- transport factory (patched in tests) -----------------------------------
 
 def _make_transport(args: argparse.Namespace) -> HttpTransport:
-    """Return the HTTP transport to use. Tests replace this function to
-    inject a fake transport without touching CLI code."""
+    """Return the HTTP transport to use. Tests replace this function."""
     return RequestsTransport()
 
 
@@ -152,7 +139,6 @@ def _pick(
     cfg_key: str,
     default: Any,
 ) -> Any:
-    """Return the flag value if set, else the config value, else default."""
     v = getattr(args, arg_name, None)
     if v is not None:
         return v
@@ -175,9 +161,6 @@ def _require(
 
 
 def _settings_from_args(args: argparse.Namespace) -> BrainSettings:
-    """Build a BrainSettings from the flags that build-pool accepts.
-    Defaults come from BrainSettings itself so there is one source of
-    truth for what 'USA / TOP3000 / delay 1' means."""
     defaults = BrainSettings()
     return BrainSettings(
         instrument_type=getattr(args, "instrument_type", None)
@@ -193,7 +176,6 @@ def _settings_from_args(args: argparse.Namespace) -> BrainSettings:
 # --- argument parser --------------------------------------------------------
 
 def _add_settings_flags(p: argparse.ArgumentParser) -> None:
-    """Attach the four flags /data-fields needs (D-107)."""
     defaults = BrainSettings()
     p.add_argument(
         "--instrument-type",
@@ -242,51 +224,37 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    # build-pool
     p_bp = sub.add_parser(
         "build-pool",
         parents=[common],
         help="fetch fields + operator names from BRAIN and write a pool",
     )
     p_bp.add_argument(
-        "--signatures",
-        required=True,
+        "--signatures", required=True,
         help="path to the operator signature table (JSON)",
     )
     p_bp.add_argument(
-        "--output",
-        default="pool.json",
+        "--output", default="pool.json",
         help="where to write the pool (default: pool.json)",
     )
     p_bp.add_argument(
-        "--page-limit",
-        type=int,
-        default=50,
+        "--page-limit", type=int, default=50,
         help=(
-            "page size for paginated endpoints (default: 500). "
-            "BRAIN limits requests per minute; a large page size "
-            "avoids hitting the limit. See D-108."
+            "page size for paginated endpoints (default: 50). "
+            "BRAIN rejects large page sizes with HTTP 400."
         ),
     )
     p_bp.add_argument(
-        "--max-retries-on-429",
-        type=int,
-        default=3,
-        help=(
-            "how many times to retry a rate-limited request "
-            "(default: 3)"
-        ),
-    )
-    p_bp.add_argument(
-        "--max-pages",
-        type=int,
-        default=200,
+        "--max-pages", type=int, default=200,
         help="hard cap on pages per endpoint (default: 200)",
+    )
+    p_bp.add_argument(
+        "--max-retries-on-429", type=int, default=3,
+        help="how many times to retry a rate-limited request (default: 3)",
     )
     _add_settings_flags(p_bp)
     p_bp.set_defaults(handler=_cmd_build_pool)
 
-    # run
     p_run = sub.add_parser(
         "run",
         parents=[common],
@@ -319,13 +287,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--n-workers", type=int, default=None)
     p_run.add_argument("--initial-population-size", type=int, default=None)
     p_run.add_argument(
-        "--dry-run",
-        action="store_true",
+        "--dry-run", action="store_true",
         help="use a deterministic fake evaluator; do not contact BRAIN",
     )
     p_run.add_argument(
-        "--telegram",
-        action="store_true",
+        "--telegram", action="store_true",
         help=(
             "send lifecycle events to Telegram "
             "(requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)"
@@ -333,39 +299,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_run.set_defaults(handler=_cmd_run)
 
-    # signatures
     p_sig = sub.add_parser(
         "signatures",
         parents=[common],
         help="audit a signature table against BRAIN's operator list",
     )
     p_sig.add_argument(
-        "--signatures",
-        required=True,
+        "--signatures", required=True,
         help="path to the signature table to audit",
     )
     p_sig.add_argument(
-        "--max-suggestions",
-        type=int,
-        default=20,
+        "--max-suggestions", type=int, default=20,
         help="how many paste-ready skeletons to print (default: 20)",
     )
     p_sig.add_argument(
-        "--strict",
-        action="store_true",
+        "--strict", action="store_true",
         help="exit non-zero if the table is missing operators",
     )
     p_sig.set_defaults(handler=_cmd_signatures)
 
-    # list-runs
     p_lr = sub.add_parser(
         "list-runs",
         parents=[common],
         help="list runs in the checkpoint root",
     )
     p_lr.add_argument(
-        "--checkpoint-root",
-        default="./checkpoints",
+        "--checkpoint-root", default="./checkpoints",
         help="checkpoint root (default: ./checkpoints)",
     )
     p_lr.set_defaults(handler=_cmd_list_runs)
@@ -376,12 +335,6 @@ def _build_parser() -> argparse.ArgumentParser:
 # --- evaluators -------------------------------------------------------------
 
 def _dry_run_evaluator(task: Task) -> TaskResult:
-    """Deterministic, thread-safe, network-free evaluator.
-
-    Fitness is derived from SHA-256(fingerprint). The same expression
-    yields the same fitness across processes, so --dry-run runs are
-    fully reproducible. See D-092.
-    """
     digest = hashlib.sha256(task.fingerprint.encode("utf-8")).digest()
     raw = int.from_bytes(digest[:8], "big", signed=False)
     fitness = (raw / float(1 << 64)) * 3.0
@@ -721,8 +674,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = _load_settings(args)
         setup_logging(settings.logging)
-        # Stash for handlers that need the defaults block.
         args._settings = settings
+        log.debug("[cli] command=%s", args.command)
         return args.handler(args)
     except CliError as e:
         log.error("%s", e)

@@ -1,18 +1,18 @@
 """Crash-safe checkpoint store for GP runs.
 
 Design decisions:
-- A Checkpoint carries metadata + an OPAQUE payload. Nothing here knows
-  what a population or an evaluation looks like. See D-014.
+- A Checkpoint carries metadata + an OPAQUE payload. See D-014.
 - JSON files, one per generation. See D-015.
-- RNG state is serialized explicitly; recovery does NOT re-seed. See D-016.
+- RNG state is serialized explicitly. See D-016.
 - Writes are atomic: tmp file + os.replace. See D-017.
-- schema_version is validated on load; run_id is validated for path
-  traversal. See D-018.
-- run_id rules live in _ids.py; shared with persistence.py. See D-026.
+- schema_version and run_id validated on load. See D-018.
+- Logs go to the "wqgp.storage" channel; save and load are at DEBUG.
+  See D-134.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
@@ -23,6 +23,9 @@ from typing import Any
 
 from wqgp._ids import validate_run_id as _validate_run_id
 from wqgp.budget import BudgetSnapshot
+
+
+log = logging.getLogger("wqgp.storage")
 
 
 SCHEMA_VERSION = 1
@@ -44,7 +47,6 @@ class CorruptCheckpointError(CheckpointError):
 
 
 def _rng_state_to_json(state: tuple[Any, ...]) -> list[Any]:
-    """random.getstate() returns nested tuples; JSON needs lists."""
     version, internal, gauss = state
     return [version, list(internal), gauss]
 
@@ -56,16 +58,11 @@ def _rng_state_from_json(blob: list[Any]) -> tuple[Any, ...]:
 
 @dataclass(frozen=True, slots=True)
 class Checkpoint:
-    """A single, self-describing restore point.
-
-    `payload` is opaque to this module. Callers serialize whatever they
-    need into it (population, evaluation cache, ...). Keeping it opaque
-    means Phase 3 can evolve the payload without touching checkpoint.py.
-    """
+    """A single, self-describing restore point."""
     run_id: str
     generation: int
     budget: BudgetSnapshot
-    rng_state: list[Any]          # already JSON-ready
+    rng_state: list[Any]
     created_at: float
     payload: dict[str, Any]
     note: str = ""
@@ -94,7 +91,6 @@ class Checkpoint:
         payload: dict[str, Any],
         note: str = "",
     ) -> "Checkpoint":
-        """Convenience: capture the live RNG state at construction time."""
         return cls(
             run_id=run_id,
             generation=generation,
@@ -106,19 +102,13 @@ class Checkpoint:
         )
 
     def restore_rng(self) -> random.Random:
-        """Return a fresh Random seeded with this checkpoint's state."""
         rng = random.Random()
         rng.setstate(_rng_state_from_json(self.rng_state))
         return rng
 
 
 class CheckpointStore:
-    """Filesystem-backed checkpoint store.
-
-    Layout:
-        <root>/<run_id>/step_000123.json
-        <root>/<run_id>/latest.txt      # contains the newest generation num
-    """
+    """Filesystem-backed checkpoint store."""
 
     def __init__(self, root: Path | str) -> None:
         self._root = Path(root)
@@ -145,7 +135,6 @@ class CheckpointStore:
     # --- write ---
 
     def save(self, checkpoint: Checkpoint) -> Path:
-        """Atomically persist a checkpoint and update the latest pointer."""
         run_dir = self._run_dir(checkpoint.run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -157,9 +146,8 @@ class CheckpointStore:
             json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, target)  # atomic on POSIX and Windows
+        os.replace(tmp, target)
 
-        # pointer update: also atomic
         latest_tmp = self._latest_path(checkpoint.run_id).with_suffix(".txt.tmp")
         with open(latest_tmp, "w", encoding="utf-8") as f:
             f.write(str(checkpoint.generation))
@@ -167,6 +155,10 @@ class CheckpointStore:
             os.fsync(f.fileno())
         os.replace(latest_tmp, self._latest_path(checkpoint.run_id))
 
+        log.debug(
+            "[storage] checkpoint saved: run=%s gen=%d",
+            checkpoint.run_id, checkpoint.generation,
+        )
         return target
 
     # --- read ---
@@ -178,7 +170,6 @@ class CheckpointStore:
         return self._read(path)
 
     def load_latest(self, run_id: str) -> Checkpoint | None:
-        """Return the newest checkpoint for `run_id`, or None if none exist."""
         latest = self._latest_path(run_id)
         if latest.exists():
             try:
@@ -208,7 +199,7 @@ class CheckpointStore:
 
         try:
             budget = BudgetSnapshot(**data["budget"])
-            return Checkpoint(
+            ckpt = Checkpoint(
                 run_id=data["run_id"],
                 generation=int(data["generation"]),
                 budget=budget,
@@ -224,6 +215,12 @@ class CheckpointStore:
             raise CorruptCheckpointError(
                 f"malformed checkpoint {path}: {e}"
             ) from e
+
+        log.debug(
+            "[storage] checkpoint loaded: run=%s gen=%d",
+            ckpt.run_id, ckpt.generation,
+        )
+        return ckpt
 
     # --- introspection ---
 
@@ -248,7 +245,6 @@ class CheckpointStore:
     # --- maintenance ---
 
     def delete_run(self, run_id: str) -> None:
-        """Remove all checkpoints for a run. No-op if absent."""
         run_dir = self._run_dir(run_id)
         if not run_dir.exists():
             return

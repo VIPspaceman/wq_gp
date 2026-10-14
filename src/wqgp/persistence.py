@@ -2,16 +2,18 @@
 
 Design decisions:
 - run_id rules shared with checkpoint via _ids.py. See D-026.
-- EvaluationRecord is a frozen value object. `fitness` is a first-class
-  field because it is the sort key; other metrics go into `metrics` as a
-  hashable tuple of pairs. See D-027.
+- EvaluationRecord is a frozen value object. See D-027.
 - SQLite with WAL + PRAGMA user_version. See D-028.
 - Upsert semantics: created_at preserved, updated_at refreshed. See D-029.
 - One connection guarded by a lock; not a pool. See D-030.
+- Logs go to the "wqgp.storage" channel. Open and schema mismatch are
+  logged; individual record writes are not. See D-134.
 """
 from __future__ import annotations
 
 import json
+import logging
+import math
 import sqlite3
 import threading
 import time
@@ -21,6 +23,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from wqgp._ids import validate_run_id
+
+
+log = logging.getLogger("wqgp.storage")
 
 
 SCHEMA_VERSION = 1
@@ -41,19 +46,26 @@ class EvaluationStatus(str, Enum):
     SKIPPED = "SKIPPED"
 
 
+def _is_finite_number(v: Any) -> bool:
+    """Finite int/float, rejecting bool and NaN/inf.
+
+    Kept in sync with the same helper in execution.py and population.py.
+    A future refactor could move this to a shared util module; for now
+    the duplication is three lines per file and avoids a new dependency
+    edge. See D-125.
+    """
+    if isinstance(v, bool):
+        return False
+    if not isinstance(v, (int, float)):
+        return False
+    if isinstance(v, float) and not math.isfinite(v):
+        return False
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class EvaluationRecord:
-    """One evaluation result.
-
-    Invariants (enforced in __post_init__):
-      - run_id passes _ids.validate_run_id
-      - generation >= 0
-      - fingerprint, expression non-empty
-      - status is EvaluationStatus
-      - metrics keys non-empty str, values int/float (bool excluded)
-      - SUCCESS requires fitness
-      - FAILED requires non-empty error
-    """
+    """One evaluation result."""
     run_id: str
     generation: int
     fingerprint: str
@@ -81,10 +93,14 @@ class EvaluationRecord:
         for k, v in self.metrics:
             if not isinstance(k, str) or not k:
                 raise ValueError("metric name must be a non-empty string")
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
+            if not _is_finite_number(v):
                 raise ValueError(
-                    f"metric {k!r} must be int/float, got {type(v).__name__}"
+                    f"metric {k!r} must be a finite number, got {v!r}"
                 )
+        if self.fitness is not None and not _is_finite_number(self.fitness):
+            raise ValueError(
+                f"fitness must be a finite number, got {self.fitness!r}"
+            )
         if self.status is EvaluationStatus.SUCCESS and self.fitness is None:
             raise ValueError("SUCCESS record requires fitness")
         if self.status is EvaluationStatus.FAILED:
@@ -143,13 +159,7 @@ _SELECT_COLS = (
 
 
 class EvaluationStore:
-    """Thread-safe SQLite store for evaluation records.
-
-    All operations serialize on an internal lock. SQLite itself allows
-    one writer + many readers in WAL mode, but since this class holds a
-    single connection, we do not benefit from that until a connection
-    pool is introduced. See D-030.
-    """
+    """Thread-safe SQLite store for evaluation records."""
 
     __slots__ = ("_path", "_lock", "_conn")
 
@@ -160,6 +170,7 @@ class EvaluationStore:
         self._conn.row_factory = sqlite3.Row
         self._configure()
         self._init_schema()
+        log.debug("[storage] opened %s", self._path)
 
     # --- setup ---
 
@@ -181,6 +192,10 @@ class EvaluationStore:
             cur.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn.commit()
         elif current != SCHEMA_VERSION:
+            log.error(
+                "[storage] schema mismatch at %s: have %d, expected %d",
+                self._path, current, SCHEMA_VERSION,
+            )
             raise IncompatibleSchemaError(
                 f"database schema version {current} != "
                 f"expected {SCHEMA_VERSION}"
@@ -225,7 +240,6 @@ class EvaluationStore:
     # --- write ---
 
     def record(self, rec: EvaluationRecord) -> None:
-        """Upsert a single record."""
         with self._lock:
             self._conn.execute(
                 _UPSERT, self._to_row_params(rec, time.time())
@@ -233,7 +247,6 @@ class EvaluationStore:
             self._conn.commit()
 
     def record_many(self, recs: Iterable[EvaluationRecord]) -> int:
-        """Upsert many records in one transaction. Returns count written."""
         rows = list(recs)
         if not rows:
             return 0
@@ -330,6 +343,7 @@ class EvaluationStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+        log.debug("[storage] closed %s", self._path)
 
     # --- dunders ---
 

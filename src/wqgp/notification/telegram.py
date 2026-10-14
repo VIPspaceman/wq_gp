@@ -4,9 +4,9 @@ Design decisions:
 - Sends over HttpTransport, not requests. See D-071, D-094.
 - Credentials come from environment variables only. See D-089, D-097.
 - Every method swallows its own exceptions. See D-095.
-- Messages are plain text; no Markdown or HTML parse mode. Special
-  characters in run_ids would otherwise need escaping, and a broken
-  escape silently drops the whole message.
+- Messages are plain text; no Markdown or HTML parse mode.
+- Logs go to the "wqgp.notification" channel. Send attempts are at
+  DEBUG; failures are at WARNING. See D-134.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from wqgp.notification.events import (
 )
 
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("wqgp.notification")
 
 
 _API_BASE = "https://api.telegram.org"
@@ -56,12 +56,7 @@ class TelegramCredentials:
 
 
 class TelegramNotifier:
-    """Sends run lifecycle events to a Telegram chat.
-
-    Thread-safe if the underlying transport is thread-safe. The
-    coordinator calls all three methods from the main thread; no
-    internal locking is needed.
-    """
+    """Sends run lifecycle events to a Telegram chat."""
 
     __slots__ = ("_credentials", "_transport", "_http_timeout")
 
@@ -129,6 +124,7 @@ class TelegramNotifier:
             "text": text,
             "disable_web_page_preview": True,
         }
+        log.debug("[notif] sending: %s", text[:80])
         try:
             resp = self._transport.request(
                 "POST",
@@ -138,13 +134,13 @@ class TelegramNotifier:
                 timeout=self._http_timeout,
             )
         except TransportError as e:
-            log.warning("telegram: transport error: %s", e)
+            log.warning("[notif] transport error: %s", e)
             return
         except Exception as e:  # noqa: BLE001 -- D-095
-            log.warning("telegram: unexpected error: %s", e)
+            log.warning("[notif] unexpected error: %s", e)
             return
 
         if resp.status_code >= 400:
             log.warning(
-                "telegram: send failed with HTTP %d", resp.status_code
+                "[notif] send failed with HTTP %d", resp.status_code
             )

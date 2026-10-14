@@ -15,16 +15,13 @@ Design decisions:
   builder takes an optional BrainSettings. See D-107.
 - HTTP 429 is retried after the interval advertised in Retry-After or
   ratelimit-reset, up to max_retries_on_429. See D-108.
-
-BRAIN does not return operator type signatures. The /operators endpoint
-gives names and descriptions only. Without signatures, an OperatorDef
-would be useless: the AST layer's type checker needs input_types,
-output_type, and param_domains. This builder therefore requires a
-signature table and drops operators it cannot build.
+- Logs go to the "wqgp.pool" channel. Page-level progress is at
+  DEBUG; fetch start/end summaries are at INFO. See D-134.
 """
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +48,9 @@ from wqgp.serialization import (
     operator_from_dict,
 )
 from wqgp.types import DataType, SemanticKind
+
+
+log = logging.getLogger("wqgp.pool")
 
 
 # --- endpoints --------------------------------------------------------------
@@ -82,7 +82,6 @@ _BRAIN_TYPE_TO_DATATYPE: dict[str, DataType] = {
 
 
 def _semantic_kind_for(data_type: DataType) -> SemanticKind:
-    """D-083: the only inference we do. GROUP -> CATEGORICAL, else NUMERIC."""
     if data_type is DataType.GROUP:
         return SemanticKind.CATEGORICAL
     return SemanticKind.NUMERIC
@@ -118,14 +117,7 @@ class PoolBuildResult:
 
 @dataclass(frozen=True, slots=True)
 class OperatorSignatureTable:
-    """Mapping from operator name to OperatorDef.
-
-    Loaded from a JSON file shaped like:
-        {
-          "schema_version": 1,
-          "operators": [ { ...operator_to_dict output... }, ... ]
-        }
-    """
+    """Mapping from operator name to OperatorDef."""
     _by_name: Mapping[str, OperatorDef]
 
     def __post_init__(self) -> None:
@@ -188,11 +180,9 @@ class OperatorSignatureTable:
         return cls.from_dict(data)
 
 
-# --- pagination helper (D-085, D-106, D-108) --------------------------------
+# --- pagination helper ------------------------------------------------------
 
 def _extract_items(payload: Any, endpoint: str) -> list[Any]:
-    """BRAIN list endpoints return either a bare list or an object with
-    a 'results' / 'data' / 'items' field. Accept both."""
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
@@ -209,7 +199,6 @@ def _extract_items(payload: Any, endpoint: str) -> list[Any]:
 
 
 def _settings_query(settings: BrainSettings) -> dict[str, str]:
-    """Render the settings the /data-fields endpoint expects."""
     return {
         "instrumentType": settings.instrument_type,
         "region": settings.region,
@@ -219,14 +208,6 @@ def _settings_query(settings: BrainSettings) -> dict[str, str]:
 
 
 def _parse_retry_after(resp: Any, default: float) -> float:
-    """Extract a wait time from the response headers.
-
-    BRAIN advertises two relevant headers:
-    - `Retry-After`: the HTTP standard.
-    - `ratelimit-reset`: a BRAIN-specific seconds-until-reset header.
-    We check Retry-After first, then ratelimit-reset. If neither parses
-    as a number, we fall back to `default`.
-    """
     for header in ("Retry-After", "ratelimit-reset"):
         raw = resp.header(header)
         if raw is None:
@@ -244,16 +225,7 @@ def _parse_retry_after(resp: Any, default: float) -> float:
 # --- builder ----------------------------------------------------------------
 
 class PoolBuilder:
-    """Fetches BRAIN's data fields and operators, and builds a Pool.
-
-    Lifecycle:
-        builder = PoolBuilder(credentials, transport, settings)
-        result = builder.build(signatures)
-        # result.pool is ready to hand to Coordinator
-
-    Not thread-safe: login state is mutated on the first call. Use one
-    builder per thread, or serialize calls.
-    """
+    """Fetches BRAIN's data fields and operators, and builds a Pool."""
 
     __slots__ = (
         "_credentials",
@@ -312,6 +284,8 @@ class PoolBuilder:
     def _ensure_authenticated(self) -> None:
         if self._authenticated:
             return
+        log.debug("[pool] login: attempting (user=%s)",
+                  self._credentials.username)
         try:
             resp = self._transport.request(
                 "POST",
@@ -320,12 +294,15 @@ class PoolBuilder:
                 timeout=self._http_timeout,
             )
         except TransportError as e:
+            log.error("[pool] login transport error: %s", e)
             raise PoolBuilderError(f"login transport error: {e}") from e
         if resp.status_code not in (200, 201):
+            log.error("[pool] login failed HTTP %d", resp.status_code)
             raise PoolBuilderError(
                 f"login failed with HTTP {resp.status_code}"
             )
         self._authenticated = True
+        log.debug("[pool] login: OK")
 
     # --- fetch ---------------------------------------------------------
 
@@ -334,23 +311,9 @@ class PoolBuilder:
         endpoint: str,
         extra_params: Mapping[str, str] | None = None,
     ) -> tuple[list[Any], int]:
-        """Fetch every page from `endpoint`. Returns (items, pages_fetched).
-
-        `extra_params` are merged into the query string on every page
-        request, alongside `limit` and `offset`. The order is
-        deterministic (sorted keys) so URLs are reproducible.
-
-        Termination:
-          - A page shorter than page_limit marks the end (D-085).
-          - A page identical to its predecessor means the server is
-            ignoring limit/offset; we return the first page (D-106).
-
-        Rate limiting:
-          - HTTP 429 is retried after the interval advertised in
-            Retry-After or ratelimit-reset, up to max_retries_on_429
-            times (D-108).
-        """
         self._ensure_authenticated()
+        log.info("[pool] fetching %s", endpoint)
+
         all_items: list[Any] = []
         offset = 0
         pages = 0
@@ -374,6 +337,10 @@ class PoolBuilder:
 
             items = _extract_items(payload, endpoint)
             pages += 1
+            log.debug(
+                "[pool] %s page %d: +%d items (total %d)",
+                endpoint, pages, len(items), len(all_items) + len(items),
+            )
 
             signature: str | None
             try:
@@ -385,11 +352,23 @@ class PoolBuilder:
                 and previous_signature is not None
                 and signature == previous_signature
             ):
+                log.debug(
+                    "[pool] %s: repeated page, server ignores pagination",
+                    endpoint,
+                )
+                log.info(
+                    "[pool] %s done: %d items from %d pages",
+                    endpoint, len(all_items), pages,
+                )
                 return all_items, pages
             previous_signature = signature
 
             all_items.extend(items)
             if len(items) < self._page_limit:
+                log.info(
+                    "[pool] %s done: %d items from %d pages",
+                    endpoint, len(all_items), pages,
+                )
                 return all_items, pages
             offset += len(items)
 
@@ -405,7 +384,6 @@ class PoolBuilder:
         sorted_extra: list[tuple[str, str]],
         offset: int,
     ):
-        """Issue one page GET, retrying on 429 up to the configured cap."""
         query_parts = [f"{k}={v}" for k, v in sorted_extra]
         query_parts.append(f"limit={self._page_limit}")
         query_parts.append(f"offset={offset}")
@@ -438,6 +416,10 @@ class PoolBuilder:
                 wait = _parse_retry_after(
                     resp, self._retry_after_default
                 )
+                log.debug(
+                    "[pool] %s 429 at offset %d, retry in %.1fs",
+                    endpoint, offset, wait,
+                )
                 self._sleep_fn(wait)
                 continue
 
@@ -451,8 +433,6 @@ class PoolBuilder:
     # --- field parsing -------------------------------------------------
 
     def _parse_field(self, raw: Any) -> FieldDef | None:
-        """Return a FieldDef, or None if the field cannot be built
-        (missing required keys or unknown DataType; see D-082)."""
         if not isinstance(raw, dict):
             return None
 
@@ -495,11 +475,6 @@ class PoolBuilder:
     def fetch_fields(
         self,
     ) -> tuple[tuple[FieldDef, ...], tuple[str, ...], int]:
-        """Fetch every field. Returns (fields, dropped_ids, pages).
-
-        The /data-fields endpoint requires simulation settings as query
-        parameters. See D-107.
-        """
         extra = _settings_query(self._settings)
         items, pages = self._fetch_paginated(_DATA_FIELDS_URL, extra)
         kept: list[FieldDef] = []
@@ -515,13 +490,13 @@ class PoolBuilder:
                 )
             else:
                 kept.append(fd)
+        log.info(
+            "[pool] data-fields parsed: %d kept, %d dropped",
+            len(kept), len(dropped),
+        )
         return tuple(kept), tuple(sorted(dropped)), pages
 
     def fetch_operator_names(self) -> tuple[tuple[str, ...], int]:
-        """Fetch every operator name. Returns (names, pages).
-
-        /operators does not require settings. See D-107.
-        """
         items, pages = self._fetch_paginated(_OPERATORS_URL)
         names: list[str] = []
         for raw in items:
@@ -530,14 +505,16 @@ class PoolBuilder:
             name = raw.get("name") or raw.get("id")
             if isinstance(name, str) and name.strip():
                 names.append(name)
+        log.info(
+            "[pool] operators parsed: %d unique names", len(set(names)),
+        )
         return tuple(sorted(set(names))), pages
 
     def build(
         self,
         signatures: OperatorSignatureTable,
     ) -> PoolBuildResult:
-        """Fetch fields + operator names, combine with `signatures`,
-        return the assembled Pool and a report."""
+        log.info("[pool] build starting")
         fields, dropped_fields, field_pages = self.fetch_fields()
         names, operator_pages = self.fetch_operator_names()
 
@@ -550,7 +527,7 @@ class PoolBuilder:
             else:
                 kept_ops.append(op)
 
-        return PoolBuildResult(
+        result = PoolBuildResult(
             pool=Pool(
                 fields=FieldPool(fields),
                 operators=OperatorPool(kept_ops),
@@ -562,12 +539,16 @@ class PoolBuilder:
             field_pages_fetched=field_pages,
             operator_pages_fetched=operator_pages,
         )
+        log.info(
+            "[pool] build done: %d fields, %d operators",
+            len(result.pool.fields), len(result.pool.operators),
+        )
+        return result
 
 
 # --- small coercion helpers -------------------------------------------------
 
 def _extract_dataset_id(raw: Any) -> str | None:
-    """`dataset` may be a string id or an object {"id":..., "name":...}."""
     if isinstance(raw, str) and raw.strip():
         return raw
     if isinstance(raw, dict):

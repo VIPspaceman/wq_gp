@@ -3406,3 +3406,47 @@ move the store's close into a context manager around `run()`, and
 let all readers run inside that scope.
 
 ---
+
+---
+
+## D-134 — Remaining logging channels; poll logs carry sim id
+
+**Decision**: fill in the remaining channels from D-132 and add a
+short BRAIN simulation id to every `[poll]` log line.
+
+Channels added this round:
+
+- `pool` — `brain/pool_builder.py`. Fetch start / end are INFO;
+  per-page progress is DEBUG.
+- `storage` — `persistence.py` and `checkpoint.py`. Store open and
+  checkpoint save/load are DEBUG; schema mismatch is ERROR.
+- `notification` — `notification/telegram.py`. Send attempts are
+  DEBUG; failures are WARNING. The logger moved from
+  `wqgp.notification.telegram` to `wqgp.notification` so the channel
+  name matches the config key exactly.
+- `cli` — `cli.py`. The logger moved from `wqgp` to `wqgp.cli` for
+  the same reason. All CLI messages now route through the channel.
+
+**Why the sim id**: the Phase 4 Step 6 dry-run revealed that two
+concurrent simulations produce interleaved `[poll] progress=10%`
+lines with no way to tell which simulation each belongs to. With
+`max_concurrent=2` the log reads as if the same progress value is
+printed twice; in fact it is two different simulations that happen
+to be at the same percentage. Extracting the sim id from the poll
+URL's last path segment gives each line a stable identifier.
+
+The id is used only in `[poll]` logs. `[submit]` does not know the
+sim id yet (it is on the response Location header, not on the
+request), and `[result]` already carries the expression, which is
+enough to identify what was evaluated.
+
+**Why `pool` per-page is DEBUG**: a full fetch of 4363 fields at
+`page_limit=50` is 88 pages. At INFO, that would be 88 lines per
+build. The start and end summaries already answer "is it running and
+did it finish"; the page-by-page detail belongs at DEBUG.
+
+**Revisit if**: a channel needs finer sub-channels (e.g.
+`pool.fetch` vs `pool.parse`). Today each file has one clear
+concern; split when that stops being true.
+
+---

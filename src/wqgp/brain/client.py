@@ -22,7 +22,9 @@ Design decisions:
   D-110.
 - WARNING with a non-empty message is a terminal failure. See D-111.
 - A semaphore bounds simultaneously active simulations. See D-112.
-- All logs go to the "wqgp.brain" channel. See D-132.
+- All logs go to the "wqgp.brain" channel. Poll logs carry the BRAIN
+  simulation id extracted from the poll URL so concurrent simulations
+  can be told apart. See D-132 and D-134.
 """
 from __future__ import annotations
 
@@ -52,11 +54,7 @@ class BrainClientError(RuntimeError):
 
 
 class BrainAuthError(BrainClientError):
-    """Raised on authentication failure. Propagates out of __call__.
-
-    Note: this is a subclass of BrainClientError, but __call__ re-raises
-    it before the generic BrainClientError handler. See D-080.
-    """
+    """Raised on authentication failure. Propagates out of __call__."""
 
 
 class BrainProtocolError(BrainClientError):
@@ -64,13 +62,7 @@ class BrainProtocolError(BrainClientError):
 
 
 class BrainConcurrencyLimitError(BrainClientError):
-    """Raised on 429 + CONCURRENT_SIMULATION_LIMIT_EXCEEDED.
-
-    Distinct from a generic rate limit because BRAIN's message is
-    specific: the account has too many active simulations. The
-    semaphore (D-112) should prevent this in normal operation; seeing
-    it means the configured max_concurrent is too high for the account.
-    """
+    """Raised on 429 + CONCURRENT_SIMULATION_LIMIT_EXCEEDED."""
 
 
 # --- config -----------------------------------------------------------------
@@ -89,7 +81,6 @@ class BrainCredentials:
 
     @classmethod
     def from_env(cls) -> "BrainCredentials":
-        """Read WQ_BRAIN_USERNAME / WQ_BRAIN_PASSWORD from the environment."""
         user = os.environ.get("WQ_BRAIN_USERNAME")
         pwd = os.environ.get("WQ_BRAIN_PASSWORD")
         if not user or not pwd:
@@ -140,7 +131,6 @@ class BrainSettings:
             raise ValueError("visualization must be a bool")
 
     def to_api_dict(self) -> dict[str, Any]:
-        """Render to the JSON body the BRAIN /simulations endpoint expects."""
         return {
             "instrumentType": self.instrument_type,
             "region": self.region,
@@ -188,11 +178,24 @@ class SimulationResult:
 # --- helpers ---------------------------------------------------------------
 
 def _truncate(s: str, n: int) -> str:
-    """Shorten a string for a single log line, no newlines."""
     s = s.replace("\n", " ").replace("\r", " ")
     if len(s) <= n:
         return s
     return s[: n - 3] + "..."
+
+
+def _sim_id_from_url(sim_url: str) -> str:
+    """Extract the BRAIN simulation id from a poll URL.
+
+    BRAIN's Location header points to URLs like
+    'https://api.worldquantbrain.com/simulations/9qEqww9V'. The last
+    path segment is the sim id. Return it, or a short fallback if the
+    URL does not end with a recognizable segment.
+    """
+    seg = sim_url.rstrip("/").rsplit("/", 1)[-1]
+    if not seg or len(seg) > 32:
+        return "????"
+    return seg
 
 
 def _format_result_line(
@@ -472,10 +475,13 @@ class BrainClient:
             raise BrainProtocolError(
                 "submit response missing Location header"
             )
-        log.debug("[submit] OK -> %s", location)
+        log.debug(
+            "[submit] OK sim=%s", _sim_id_from_url(location)
+        )
         return location
 
     def _poll(self, sim_url: str) -> SimulationResult:
+        sim_id = _sim_id_from_url(sim_url)
         deadline = time.monotonic() + self._poll_timeout_seconds
         consecutive_errors = 0
         last_progress: float | None = None
@@ -483,8 +489,8 @@ class BrainClient:
         for _ in range(self._max_polls):
             if time.monotonic() > deadline:
                 log.warning(
-                    "[poll] exceeded %.0fs timeout",
-                    self._poll_timeout_seconds,
+                    "[poll sim=%s] exceeded %.0fs timeout",
+                    sim_id, self._poll_timeout_seconds,
                 )
                 raise BrainClientError(
                     f"poll exceeded {self._poll_timeout_seconds}s"
@@ -499,14 +505,15 @@ class BrainClient:
                 consecutive_errors += 1
                 wait = self._backoff(consecutive_errors)
                 log.debug(
-                    "[poll] transport error, backoff %.1fs", wait,
+                    "[poll sim=%s] transport error, backoff %.1fs",
+                    sim_id, wait,
                 )
                 self._sleep_fn(wait)
                 continue
 
             if resp.status_code == 401:
                 self._invalidate_auth()
-                log.warning("[poll] 401, invalidating auth")
+                log.warning("[poll sim=%s] 401, invalidating auth", sim_id)
                 raise BrainAuthError("poll rejected: not authenticated")
 
             if resp.status_code == 202:
@@ -518,14 +525,14 @@ class BrainClient:
                     consecutive_errors += 1
                     wait = self._backoff(consecutive_errors)
                     log.debug(
-                        "[poll] HTTP %d, backoff %.1fs",
-                        resp.status_code, wait,
+                        "[poll sim=%s] HTTP %d, backoff %.1fs",
+                        sim_id, resp.status_code, wait,
                     )
                     self._sleep_fn(wait)
                     continue
                 log.warning(
-                    "[poll] HTTP %d: %s",
-                    resp.status_code, _safe_text(resp),
+                    "[poll sim=%s] HTTP %d: %s",
+                    sim_id, resp.status_code, _safe_text(resp),
                 )
                 raise BrainClientError(
                     f"poll failed with HTTP {resp.status_code}: "
@@ -535,7 +542,7 @@ class BrainClient:
             try:
                 data = resp.json()
             except ValueError as e:
-                log.warning("[poll] non-JSON body: %s", e)
+                log.warning("[poll sim=%s] non-JSON body: %s", sim_id, e)
                 raise BrainProtocolError(
                     f"poll returned non-JSON body: {e}"
                 ) from e
@@ -553,7 +560,10 @@ class BrainClient:
                     or data.get("error")
                     or "simulation ERROR"
                 )
-                log.warning("[poll] ERROR: %s", _truncate(str(msg), 100))
+                log.warning(
+                    "[poll sim=%s] ERROR: %s",
+                    sim_id, _truncate(str(msg), 100),
+                )
                 return SimulationResult(
                     alpha_id=None,
                     metrics=(),
@@ -564,8 +574,8 @@ class BrainClient:
                 msg = data.get("message", "")
                 if msg:
                     log.warning(
-                        "[poll] WARNING terminal: %s",
-                        _truncate(str(msg), 100),
+                        "[poll sim=%s] WARNING terminal: %s",
+                        sim_id, _truncate(str(msg), 100),
                     )
                     return SimulationResult(
                         alpha_id=None,
@@ -581,7 +591,9 @@ class BrainClient:
                     raise BrainProtocolError(
                         "COMPLETE response without 'alpha' id"
                     )
-                log.debug("[poll] complete alpha=%s", alpha_id)
+                log.debug(
+                    "[poll sim=%s] complete alpha=%s", sim_id, alpha_id,
+                )
                 return self._fetch_alpha_metrics(alpha_id)
 
             # No status: {"progress": float}
@@ -594,12 +606,17 @@ class BrainClient:
                 if p is not None and (
                     last_progress is None or abs(p - last_progress) > 0.001
                 ):
-                    log.info("[poll] progress=%.0f%%", p * 100.0)
+                    log.info(
+                        "[poll sim=%s] progress=%.0f%%",
+                        sim_id, p * 100.0,
+                    )
                     last_progress = p
 
             self._sleep_fn(self._next_poll_interval(resp))
 
-        log.warning("[poll] exceeded %d attempts", self._max_polls)
+        log.warning(
+            "[poll sim=%s] exceeded %d attempts", sim_id, self._max_polls,
+        )
         raise BrainClientError(
             f"poll exceeded {self._max_polls} attempts"
         )
@@ -668,7 +685,6 @@ class BrainClient:
 
 
 def _extract_error_detail(resp: HttpResponse) -> str:
-    """Read BRAIN's {'detail': '...'} error body, or fall back to text."""
     try:
         data = resp.json()
     except ValueError:
