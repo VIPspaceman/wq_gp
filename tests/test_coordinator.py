@@ -228,7 +228,7 @@ def test_run_respects_max_generations(tmp_path: Path) -> None:
 def test_run_writes_checkpoint(tmp_path: Path) -> None:
     cfg = _config(tmp_path, max_generations=2)
     Coordinator(cfg, _deterministic_evaluator).run()
-    ckpt_dir = Path(cfg.checkpoint_root) / cfg.run_id
+    ckpt_dir = Path(cfg.checkpoint_root) / "runs" / cfg.run_id
     assert ckpt_dir.exists()
     step_files = list(ckpt_dir.glob("step_*.json"))
     assert len(step_files) >= 1
@@ -301,3 +301,23 @@ def test_elites_not_reevaluated_across_generations(tmp_path: Path) -> None:
     cfg = _config(tmp_path, max_generations=3, pop_size=4, total_sims=500)
     Coordinator(cfg, counting_evaluator).run()
     assert submitted_count["n"] <= 12
+
+
+def test_resume_rejects_budget_lower_than_used(tmp_path: Path) -> None:
+    """Resuming with --total-simulations lower than already used must
+    raise a CoordinatorError with an actionable message. See D-162.
+    """
+    # First run: uses whatever budget is needed for 2 generations.
+    cfg1 = _config(tmp_path, max_generations=2, total_sims=100, seed=7)
+    Coordinator(cfg1, _deterministic_evaluator).run()
+
+    # Second run: same run_id -> resume path. Budget lower than the
+    # amount already spent in run 1 -> must fail before submitting.
+    cfg2 = _config(tmp_path, max_generations=3, total_sims=3, seed=7)
+    with pytest.raises(CoordinatorError) as exc_info:
+        Coordinator(cfg2, _deterministic_evaluator).run()
+
+    msg = str(exc_info.value)
+    assert "already used" in msg
+    assert "--total-simulations" in msg
+    assert str(cfg1.run_id) in msg

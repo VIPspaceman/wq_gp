@@ -242,7 +242,7 @@ def test_run_dry_run_end_to_end(tmp_path: Path) -> None:
     ])
     assert code == cli.EXIT_OK
 
-    run_dir = ckpt_root / "smoke"
+    run_dir = ckpt_root / "runs" / "smoke"
     assert run_dir.exists()
     assert list(run_dir.glob("step_*.json"))
 
@@ -267,7 +267,7 @@ def test_run_config_file_provides_defaults(tmp_path: Path) -> None:
         "--dry-run",
     ])
     assert code == cli.EXIT_OK
-    assert (tmp_path / "ckpt" / "from_cfg").exists()
+    assert (tmp_path / "ckpt" / "runs" / "from_cfg").exists()
 
 
 def test_run_flag_overrides_config(tmp_path: Path) -> None:
@@ -292,8 +292,8 @@ def test_run_flag_overrides_config(tmp_path: Path) -> None:
     ])
     assert code == cli.EXIT_OK
     # Run id came from the flag, not the config.
-    assert (tmp_path / "ckpt" / "overridden").exists()
-    assert not (tmp_path / "ckpt" / "from_cfg").exists()
+    assert (tmp_path / "ckpt" / "runs" / "overridden").exists()
+    assert not (tmp_path / "ckpt" / "runs" / "from_cfg").exists()
 
 
 def test_run_invalid_config_json(tmp_path: Path) -> None:

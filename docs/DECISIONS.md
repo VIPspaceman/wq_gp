@@ -4333,3 +4333,42 @@ setting rather than a fixed convention. Do NOT reintroduce config
 files at the root.
 
 ---
+
+---
+
+## D-160 — cache_key includes the fitness strategy
+
+**Decision**: `EvaluationConfig.cache_key(fingerprint, fitness_strategy)`
+takes two arguments. The key material becomes
+`"<version>:<fingerprint>:<settings_hash>:<fitness_strategy>"`.
+
+`fitness_strategy` is mandatory. There is no default.
+
+**Why**: without this, two runs that differ only in fitness function
+share cache entries. A concrete failure mode that was about to happen:
+
+1. Run A uses `--fitness-strategy feasibility`. Its cache entries hold
+   feasibility-first scores (tier values, roughly `[1, 1.25]` for
+   submittable alphas and negative for FAILs).
+2. Run B uses `--fitness-strategy sharpe`. It looks up the same
+   `(fingerprint, settings_hash)`, finds Run A's entry, and uses the
+   feasibility score as if it were a raw sharpe.
+3. The GP in Run B now ranks individuals on a mix of raw sharpe
+   (freshly evaluated this run) and tier-valued feasibility
+   (cache hits). The selection pressure becomes incoherent.
+
+The same failure runs in reverse. The only fix that keeps both
+strategies usable is to make the strategy part of the cache identity.
+
+Consequence: entries written under the old key format (pre-D-160) will
+never match a new key. They become inert but are not deleted;
+`wqgp cache stats` continues to count them. To start clean, run
+`wqgp cache clear --yes`.
+
+**Revisit if**: a third fitness strategy appears. The key material
+already includes the strategy as an opaque string, so no format change
+is needed — just add the strategy to `--fitness-strategy`'s choices
+and `_fitness_fn_for`. Do NOT add a per-strategy version prefix; the
+current single version constant is enough.
+
+---

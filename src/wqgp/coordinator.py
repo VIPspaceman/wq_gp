@@ -81,6 +81,7 @@ class RunConfig:
     selection: SelectionConfig
     seed: int
     evaluation_config: EvaluationConfig
+    fitness_strategy: str = "feasibility"
     max_generations: int = 10
     checkpoint_root: Path = Path("./checkpoints")
     evaluation_db: Path | None = None
@@ -112,6 +113,13 @@ class RunConfig:
             raise ValueError("crossover_max_depth must be >= 1")
         if self.crossover_max_nodes < 1:
             raise ValueError("crossover_max_nodes must be >= 1")
+        if self.crossover_max_nodes < 1:
+            raise ValueError("crossover_max_nodes must be >= 1")
+        if self.fitness_strategy not in ("feasibility", "sharpe"):
+            raise ValueError(
+                f"fitness_strategy must be 'feasibility' or 'sharpe', "
+                f"got {self.fitness_strategy!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +166,10 @@ class Coordinator:
         if config.evaluation_db is not None:
             db_path = Path(config.evaluation_db)
         else:
-            db_path = Path(config.checkpoint_root) / f"{config.run_id}.db"
+            db_path = (
+                Path(config.checkpoint_root) / "runs"
+                / f"{config.run_id}.db"
+            )
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._store = EvaluationStore(db_path)
 
@@ -382,10 +393,28 @@ class Coordinator:
         pop = self._load_population_from_checkpoint(ckpt)
 
         snap = ckpt.budget
+        used = snap.total_simulations_used
+        limit = self._config.budget.total_simulations
+
+        # BudgetTracker raises a bare ValueError when `used > limit`,
+        # which surfaces as "unexpected error" in the CLI. Catch it
+        # here and raise a CoordinatorError with a message the user
+        # can act on. See D-162.
+        if used > limit:
+            raise CoordinatorError(
+                f"cannot resume run {self._config.run_id!r} from "
+                f"generation {ckpt.generation}: it has already used "
+                f"{used} simulations, but the new budget only allows "
+                f"{limit}. Increase --total-simulations to at least "
+                f"{used}, or delete the checkpoint at "
+                f"{self._config.checkpoint_root}/runs/"
+                f"{self._config.run_id}/ to start fresh."
+            )
+
         tracker = BudgetTracker(
             self._config.budget,
             elapsed_offset_seconds=snap.elapsed_seconds,
-            total_simulations_used=snap.total_simulations_used,
+            total_simulations_used=used,
             generation_simulations_used=0,
         )
         rng = ckpt.restore_rng()
@@ -459,7 +488,10 @@ class Coordinator:
 
     def _lookup_cache(self, ind: Individual) -> CacheEntry | None:
         assert self._cache is not None
-        key = self._config.evaluation_config.cache_key(ind.fingerprint)
+        key = self._config.evaluation_config.cache_key(
+            ind.fingerprint,
+            self._config.fitness_strategy,
+        )
         return self._cache.get(key)
 
     def _record_cache_hit(
@@ -523,7 +555,10 @@ class Coordinator:
             return
 
         cfg = self._config.evaluation_config
-        cache_key = cfg.cache_key(rec.fingerprint)
+        cache_key = cfg.cache_key(
+            rec.fingerprint,
+            self._config.fitness_strategy,
+        )
         created_at = rec.created_at if rec.created_at > 0 else time.time()
 
         if rec.status is EvaluationStatus.SUCCESS:

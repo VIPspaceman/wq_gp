@@ -596,8 +596,8 @@ def _make_evaluator(
     args: argparse.Namespace,
     settings: Settings,
     evaluation_config: EvaluationConfig,
+    fitness_strategy: str,
     alpha_registry: AlphaRegistry | None = None,
-    run_cfg: dict[str, Any] | None = None,
 ) -> Evaluator:
     if args.dry_run:
         log.warning("dry-run mode: BRAIN will not be contacted")
@@ -611,11 +611,8 @@ def _make_evaluator(
     if max_concurrent is None:
         max_concurrent = settings.defaults.max_concurrent
 
-    fitness_fn = _resolve_fitness_fn(args, run_cfg or {})
-    log.info(
-        "fitness strategy: %s",
-        "sharpe" if fitness_fn is sharpe_only_fitness else "feasibility",
-    )
+    fitness_fn = _fitness_fn_for(fitness_strategy)
+    log.info("fitness strategy: %s", fitness_strategy)
 
     return _build_client_with_creds(
         creds, evaluation_config, max_concurrent,
@@ -642,14 +639,24 @@ def _build_client_with_creds(
     )
 
 
-def _resolve_fitness_fn(
-    args: argparse.Namespace, cfg: dict[str, Any]
-):
-    """Pick the fitness function from --fitness-strategy or config."""
+def _resolve_fitness_strategy(
+    args: argparse.Namespace, cfg: dict[str, Any],
+) -> str:
+    """Return the strategy name: 'feasibility' or 'sharpe'."""
     raw = _pick(
         args, cfg, "fitness_strategy", "fitness_strategy", "feasibility",
     )
-    if raw == "sharpe":
+    if raw not in ("feasibility", "sharpe"):
+        raise CliError(
+            f"invalid fitness strategy: {raw!r}; "
+            f"expected 'feasibility' or 'sharpe'"
+        )
+    return raw
+
+
+def _fitness_fn_for(strategy: str):
+    """Map a strategy name to its fitness function."""
+    if strategy == "sharpe":
         return sharpe_only_fitness
     return feasibility_fitness
 
@@ -852,6 +859,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
     evaluation_config = _build_evaluation_config(args)
+    fitness_strategy = _resolve_fitness_strategy(args, cfg)
 
     run_cfg = RunConfig(
         run_id=str(_require(args, cfg, "run_id", "run_id", "--run-id")),
@@ -860,6 +868,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         selection=_resolve_selection(args, cfg),
         seed=int(_pick(args, cfg, "seed", "seed", defaults.seed)),
         evaluation_config=evaluation_config,
+        fitness_strategy=fitness_strategy,
         max_generations=int(
             _pick(
                 args, cfg, "max_generations", "max_generations",
@@ -912,8 +921,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     evaluator = _make_evaluator(
         args, settings, evaluation_config,
+        fitness_strategy=fitness_strategy,
         alpha_registry=alpha_registry,
-        run_cfg=cfg,
     )
     notifier = _make_notifier(args)
     cache = _make_cache(args, settings)

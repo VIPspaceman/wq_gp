@@ -6,8 +6,10 @@ Design decisions:
 - RNG state is serialized explicitly. See D-016.
 - Writes are atomic: tmp file + os.replace. See D-017.
 - schema_version and run_id validated on load. See D-018.
-- Logs go to the "wqgp.storage" channel; save and load are at DEBUG.
-  See D-134.
+- Logs go to the "wqgp.storage" channel. See D-134.
+- Run checkpoints live under <root>/runs/<run_id>/. The root also
+  hosts cache.db and alphas.db, so keeping runs in a subdirectory
+  keeps the three stores visibly separate. See D-161.
 """
 from __future__ import annotations
 
@@ -32,6 +34,7 @@ SCHEMA_VERSION = 1
 
 _STEP_RE = re.compile(r"^step_(\d+)\.json$")
 _LATEST_FILE = "latest.txt"
+_RUNS_SUBDIR = "runs"
 
 
 class CheckpointError(RuntimeError):
@@ -108,21 +111,33 @@ class Checkpoint:
 
 
 class CheckpointStore:
-    """Filesystem-backed checkpoint store."""
+    """Filesystem-backed checkpoint store.
+
+    Layout:
+        <root>/cache.db                  (owned by EvaluationCache)
+        <root>/alphas.db                 (owned by AlphaRegistry)
+        <root>/runs/<run_id>/step_NNNNNN.json
+        <root>/runs/<run_id>/latest.txt
+    """
 
     def __init__(self, root: Path | str) -> None:
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
+        self._runs_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def root(self) -> Path:
         return self._root
 
+    @property
+    def _runs_dir(self) -> Path:
+        return self._root / _RUNS_SUBDIR
+
     # --- paths ---
 
     def _run_dir(self, run_id: str) -> Path:
         _validate_run_id(run_id)
-        return self._root / run_id
+        return self._runs_dir / run_id
 
     def _step_path(self, run_id: str, generation: int) -> Path:
         if generation < 0:
@@ -236,10 +251,10 @@ class CheckpointStore:
         return sorted(gens)
 
     def list_runs(self) -> list[str]:
-        if not self._root.exists():
+        if not self._runs_dir.exists():
             return []
         return sorted(
-            p.name for p in self._root.iterdir() if p.is_dir()
+            p.name for p in self._runs_dir.iterdir() if p.is_dir()
         )
 
     # --- maintenance ---

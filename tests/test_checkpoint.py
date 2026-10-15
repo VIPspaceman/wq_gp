@@ -83,7 +83,7 @@ def test_load_latest_returns_highest(store: CheckpointStore) -> None:
 
 def test_load_latest_falls_back_without_pointer(store: CheckpointStore) -> None:
     store.save(_make_cp(generation=5))
-    (store.root / "run_a" / "latest.txt").unlink()
+    (store.root / "runs" / "run_a" / "latest.txt").unlink()
     latest = store.load_latest("run_a")
     assert latest is not None
     assert latest.generation == 5
@@ -92,7 +92,7 @@ def test_load_latest_falls_back_without_pointer(store: CheckpointStore) -> None:
 def test_load_latest_raises_on_stale_pointer(store: CheckpointStore) -> None:
     store.save(_make_cp(generation=0))
     # simulate the step file being deleted out from under the pointer
-    (store.root / "run_a" / "step_000000.json").unlink()
+    (store.root / "runs" / "run_a" / "step_000000.json").unlink()
     with pytest.raises(CorruptCheckpointError):
         store.load_latest("run_a")
 
@@ -139,7 +139,7 @@ def test_schema_version_mismatch_rejected_on_construct() -> None:
 
 def test_schema_version_mismatch_rejected_on_load(store: CheckpointStore) -> None:
     store.save(_make_cp())
-    path = store.root / "run_a" / "step_000000.json"
+    path = store.root / "runs" / "run_a" / "step_000000.json"
     data = json.loads(path.read_text())
     data["schema_version"] = 999
     path.write_text(json.dumps(data))
@@ -151,7 +151,7 @@ def test_schema_version_mismatch_rejected_on_load(store: CheckpointStore) -> Non
 
 def test_corrupt_json_raises(store: CheckpointStore) -> None:
     store.save(_make_cp())
-    path = store.root / "run_a" / "step_000000.json"
+    path = store.root / "runs" / "run_a" / "step_000000.json"
     path.write_text("{ not json")
     with pytest.raises(CorruptCheckpointError):
         store.load("run_a", 0)
@@ -164,7 +164,7 @@ def test_missing_file_raises_filenotfound(store: CheckpointStore) -> None:
 
 def test_malformed_budget_raises_corrupt(store: CheckpointStore) -> None:
     store.save(_make_cp())
-    path = store.root / "run_a" / "step_000000.json"
+    path = store.root / "runs" / "run_a" / "step_000000.json"
     data = json.loads(path.read_text())
     data["budget"] = {"unexpected": True}
     path.write_text(json.dumps(data))
