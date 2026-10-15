@@ -617,20 +617,24 @@ class Coordinator:
         log.info(
             "[%s] run finished: reason=%s generations=%d "
             "total_sims=%d success=%d failed=%d rate=%.1f%% "
-            "cache_hits=%d",
+            "cache_hits=%d fitness_strategy=%s",
             rid, result.stopped_reason, result.generation,
             result.total_simulations_used, success, failed, rate,
-            result.cache_hits,
+            result.cache_hits, self._config.fitness_strategy,
         )
 
         top = self._store.top_by_fitness(rid, 3)
         for i, rec in enumerate(top, start=1):
-            to = dict(rec.metrics).get("turnover")
+            m = dict(rec.metrics)
+            to = m.get("turnover")
             to_str = f"{to:.4f}" if to is not None else "?"
+            sharpe = m.get("sharpe")
+            sharpe_str = f"{sharpe:.4f}" if sharpe is not None else "?"
             expr = _truncate(rec.expression, 100)
             log.info(
-                "[%s]   top %d: sharpe=%.4f turnover=%s expr=%s",
-                rid, i, rec.fitness, to_str, expr,
+                "[%s]   top %d: fitness=%.4f sharpe=%s "
+                "turnover=%s expr=%s",
+                rid, i, rec.fitness, sharpe_str, to_str, expr,
             )
 
     def _safe_notify(self, fn, event) -> None:
