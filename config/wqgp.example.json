@@ -1,0 +1,42 @@
+{
+  "$schema": "./wqgp.schema.json",
+
+  "credentials": {
+    "username": "YOUR_BRAIN_USERNAME_HERE",
+    "password": "YOUR_BRAIN_PASSWORD_HERE"
+  },
+
+  "logging": {
+    "level": "INFO",
+    "style": "default",
+    "file": "./logs/wqgp.log",
+    "channels": {
+      "brain": "INFO",
+      "gp": "INFO",
+      "pool": "INFO",
+      "execution": "OFF",
+      "storage": "WARNING",
+      "notification": "WARNING",
+      "cli": "INFO"
+    }
+  },
+
+  "cache": {
+    "enabled": true,
+    "ttl_days": 90,
+    "path": null
+  },
+
+  "defaults": {
+    "region": "USA",
+    "universe": "TOP3000",
+    "delay": 1,
+    "decay": 4,
+    "neutralization": "INDUSTRY",
+    "n_workers": 4,
+    "max_concurrent": 2,
+    "seed": 42,
+    "max_generations": 10,
+    "checkpoint_root": "./checkpoints"
+  }
+}

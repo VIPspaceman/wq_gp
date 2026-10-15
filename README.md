@@ -30,6 +30,24 @@ Secrets are read only from the environment:
     export WQ_BRAIN_USERNAME=...
     export WQ_BRAIN_PASSWORD=...
 
+## Setup
+
+Copy the example settings file and fill in your BRAIN credentials:
+
+    cp config/wqgp.example.json config/wqgp.json
+    chmod 600 config/wqgp.json
+    # edit config/wqgp.json and replace YOUR_BRAIN_USERNAME_HERE
+    # and YOUR_BRAIN_PASSWORD_HERE with real values
+
+Then run the CLI with `--settings config/wqgp.json`:
+
+    python -m wqgp run --settings config/wqgp.json ...
+
+Alternatively, set the environment variables `WQ_BRAIN_USERNAME` and
+`WQ_BRAIN_PASSWORD` and skip the credentials block entirely. Env vars
+take precedence over the config file.
+
+
 ### 1. Audit / build the signature table
 
 BRAIN's `/operators` endpoint returns names and descriptions only, not
