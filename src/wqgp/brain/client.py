@@ -3,45 +3,45 @@
 Design decisions:
 - BrainClient depends on HttpTransport, not requests. See D-071.
 - Cookies live in the transport's session. See D-072.
-- Credentials are supplied at construction; from_env() reads the
-  standard variables. See D-073.
-- BrainSettings is a frozen dataclass; validation is type-only. See
-  D-074.
-- Fitness is derived from in-sample metrics via a pluggable callable;
-  the default returns the sharpe. See D-075.
-- Poll intervals come from the server's Retry-After header; transient
-  errors get exponential backoff. See D-076.
-- Each task is bounded by max_polls AND poll_timeout_seconds; sleep_fn
-  is injectable for tests. See D-077.
-- Server rejections produce TaskResult(status=FAILED). Auth failures
-  raise BrainAuthError, which __call__ propagates unchanged. See
-  D-078 and D-080.
-- Poll responses have two shapes: {"progress": float} while running,
-  {"status": "COMPLETE", "alpha": "<id>"} when done. Metrics are NOT
-  in the poll response; a second GET /alphas/{id} is required. See
-  D-110.
-- WARNING with a non-empty message is a terminal failure. See D-111.
-- A semaphore bounds simultaneously active simulations. See D-112.
-- All logs go to the "wqgp.brain" channel. Poll logs carry the BRAIN
-  simulation id extracted from the poll URL so concurrent simulations
-  can be told apart. See D-132 and D-134.
+- Credentials: env vars, with optional config-file fallback. See D-073,
+  D-089, D-135.
+- BrainSettings validation is type-only. See D-074.
+- Fitness is a pluggable callable taking (metrics, checks). See D-075
+  and D-156.
+- Poll intervals honor Retry-After; transient errors back off. See
+  D-076.
+- Each task is bounded by max_polls AND poll_timeout_seconds. See
+  D-077.
+- Server rejections -> TaskResult(FAILED). Auth failures raise. See
+  D-078, D-080.
+- Poll responses are two-step; metrics need a second GET. See D-110.
+- WARNING with a message is terminal. See D-111.
+- A semaphore bounds simultaneous simulations. See D-112.
+- Defaults match BRAIN-accepted values. See D-113.
+- All logs go to "wqgp.brain". Poll logs carry the sim id. See D-134.
+- When an AlphaRegistry is supplied, every successful simulation's
+  raw alpha detail is upserted into it. See D-155.
+- The default fitness is feasibility-first: checks take priority over
+  raw sharpe. See D-157.
 """
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from wqgp.alpha_registry import AlphaCheck, AlphaRegistry, extract_checks
+from wqgp.brain.settings import BrainSettings
 from wqgp.brain.transport import (
     HttpResponse,
     HttpTransport,
     RequestsTransport,
     TransportError,
 )
-from wqgp.brain.settings import BrainSettings
 from wqgp.execution import Task, TaskResult, TaskStatus
 
 
@@ -91,76 +91,127 @@ class BrainCredentials:
         return cls(username=user, password=pwd)
 
 
-# @dataclass(frozen=True, slots=True)
-# class BrainSettings:
-#     """Frozen simulation settings.
-
-#     Defaults (decay=4, neutralization="INDUSTRY") match values observed
-#     to be accepted by BRAIN's /simulations endpoint for a TUTORIAL
-#     account. See D-113.
-#     """
-#     instrument_type: str = "EQUITY"
-#     region: str = "USA"
-#     universe: str = "TOP3000"
-#     delay: int = 1
-#     decay: int = 4
-#     neutralization: str = "INDUSTRY"
-#     truncation: float = 0.08
-#     pasteurization: str = "ON"
-#     nan_handling: str = "OFF"
-#     unit_handling: str = "VERIFY"
-#     language: str = "FASTEXPR"
-#     visualization: bool = False
-#     test_period: str = "P0Y0M"
-
-#     def __post_init__(self) -> None:
-#         if not isinstance(self.delay, int) or isinstance(self.delay, bool):
-#             raise ValueError("delay must be an int")
-#         if self.delay < 0:
-#             raise ValueError("delay must be >= 0")
-#         if not isinstance(self.decay, int) or isinstance(self.decay, bool):
-#             raise ValueError("decay must be an int")
-#         if self.decay < 0:
-#             raise ValueError("decay must be >= 0")
-#         if not isinstance(self.truncation, (int, float)) or isinstance(
-#             self.truncation, bool
-#         ):
-#             raise ValueError("truncation must be a number")
-#         if not 0.0 <= float(self.truncation) <= 1.0:
-#             raise ValueError("truncation must be in [0.0, 1.0]")
-#         if not isinstance(self.visualization, bool):
-#             raise ValueError("visualization must be a bool")
-
-#     def to_api_dict(self) -> dict[str, Any]:
-#         return {
-#             "instrumentType": self.instrument_type,
-#             "region": self.region,
-#             "universe": self.universe,
-#             "delay": self.delay,
-#             "decay": self.decay,
-#             "neutralization": self.neutralization,
-#             "truncation": float(self.truncation),
-#             "pasteurization": self.pasteurization,
-#             "nanHandling": self.nan_handling,
-#             "unitHandling": self.unit_handling,
-#             "language": self.language,
-#             "visualization": self.visualization,
-#             "testPeriod": self.test_period,
-#         }
-
-
 # --- fitness -----------------------------------------------------------------
 
 MetricsView = dict[str, float]
-FitnessFunction = Callable[[MetricsView], float | None]
+FitnessFunction = Callable[
+    [MetricsView, "tuple[AlphaCheck, ...] | None"],
+    "float | None",
+]
 
 
-def default_fitness(metrics: MetricsView) -> float | None:
-    """Default: return `sharpe` from the in-sample metrics, or None."""
+def _check_violation(check: AlphaCheck) -> float:
+    """How badly a FAILed check missed its threshold.
+
+    0.0 = at threshold, 1.0 = missed by a whole limit's worth.
+    Returns 1.0 for boolean checks without value/limit.
+    """
+    value = check.value
+    limit = check.limit
+    if value is None or limit is None:
+        return 1.0
+    if limit == 0:
+        return 1.0
+    name = check.name
+    if name.startswith("LOW_"):
+        gap = limit - value
+    elif name.startswith("HIGH_"):
+        gap = value - limit
+    else:
+        return 1.0
+    if gap <= 0:
+        return 0.0
+    return gap / abs(limit)
+
+
+def sharpe_only_fitness(
+    metrics: MetricsView,
+    checks: tuple[AlphaCheck, ...] | None = None,
+) -> float | None:
+    """Legacy fitness: return sharpe, ignore checks.
+
+    Kept for `--fitness-strategy sharpe` and for callers that want the
+    pre-D-157 behavior.
+
+    Rejects NaN, +/-inf, and bool. bool is checked before the float()
+    call because bool is a subclass of int and float(True) == 1.0,
+    which would silently pass a bool off as a valid sharpe.
+    """
     sharpe = metrics.get("sharpe")
     if sharpe is None:
         return None
-    return float(sharpe)
+    if isinstance(sharpe, bool):
+        return None
+    try:
+        value = float(sharpe)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def feasibility_fitness(
+    metrics: MetricsView,
+    checks: tuple[AlphaCheck, ...] | None = None,
+) -> float | None:
+    """Feasibility-first scalar fitness. See D-157.
+
+    Three tiers:
+      +1.00 .. +1.25   all relevant checks PASS
+      -0.25 .. +0.25   no FAIL, but some checks pending/missing
+      -inf  .. -1.00   at least one FAIL; closer to threshold is better
+
+    When `checks` is None or empty, falls back to raw sharpe so that
+    evaluation records written before D-157 remain comparable within
+    themselves.
+    """
+    sharpe = metrics.get("sharpe")
+    if sharpe is None:
+        return None
+    if isinstance(sharpe, bool):
+        return None
+    try:
+        sharpe = float(sharpe)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(sharpe):
+        return None
+
+    if not checks:
+        return sharpe
+
+    # SELF_CORRELATION is PENDING until submission; ignore at GP time.
+    relevant = tuple(c for c in checks if c.name != "SELF_CORRELATION")
+    if not relevant:
+        return sharpe
+
+    sharpe_bonus = 0.25 * math.tanh(sharpe / 2.0)
+
+    failures = tuple(c for c in relevant if c.failed)
+    pending = tuple(
+        c for c in relevant
+        if c.result in ("PENDING", "WARNING")
+    )
+
+    if failures:
+        violation = sum(_check_violation(c) for c in failures)
+        return (
+            -1.0
+            - 0.25 * len(failures)
+            - violation
+            + sharpe_bonus
+        )
+
+    if pending:
+        return sharpe_bonus
+
+    return 1.0 + sharpe_bonus
+
+
+# The default is feasibility-first. Kept as a named alias for callers
+# that import default_fitness by name.
+default_fitness = feasibility_fitness
 
 
 # --- simulation result -------------------------------------------------------
@@ -171,6 +222,7 @@ class SimulationResult:
     alpha_id: str | None
     metrics: tuple[tuple[str, float], ...]
     error_message: str | None = None
+    raw_alpha: dict | None = None
 
     def metrics_dict(self) -> MetricsView:
         return dict(self.metrics)
@@ -186,13 +238,6 @@ def _truncate(s: str, n: int) -> str:
 
 
 def _sim_id_from_url(sim_url: str) -> str:
-    """Extract the BRAIN simulation id from a poll URL.
-
-    BRAIN's Location header points to URLs like
-    'https://api.worldquantbrain.com/simulations/9qEqww9V'. The last
-    path segment is the sim id. Return it, or a short fallback if the
-    URL does not end with a recognizable segment.
-    """
     seg = sim_url.rstrip("/").rsplit("/", 1)[-1]
     if not seg or len(seg) > 32:
         return "????"
@@ -206,7 +251,6 @@ def _format_result_line(
     expression: str,
     error: str | None,
 ) -> str:
-    """One-line summary of a single simulation for the [result] log."""
     expr = _truncate(expression, 100)
     if error is not None:
         return f"[result] FAILED err={_truncate(error, 80)} expr={expr}"
@@ -229,12 +273,7 @@ _SIMULATIONS_URL = f"{_BASE_URL}/simulations"
 
 
 class BrainClient:
-    """Implements the Evaluator protocol against the BRAIN API.
-
-    Thread-safety:
-    - Login state is guarded by a lock.
-    - Active simulations are bounded by a semaphore (D-112).
-    """
+    """Implements the Evaluator protocol against the BRAIN API."""
 
     __slots__ = (
         "_credentials",
@@ -247,6 +286,7 @@ class BrainClient:
         "_base_poll_interval",
         "_http_timeout",
         "_max_concurrent",
+        "_alpha_registry",
         "_concurrency_semaphore",
         "_authenticated",
         "_lock",
@@ -258,13 +298,14 @@ class BrainClient:
         settings: BrainSettings,
         transport: HttpTransport,
         *,
-        fitness_fn: FitnessFunction = default_fitness,
+        fitness_fn: FitnessFunction = feasibility_fitness,
         sleep_fn: Callable[[float], None] = time.sleep,
         max_polls: int = 120,
         poll_timeout_seconds: float = 600.0,
         base_poll_interval: float = 3.0,
         http_timeout: float = 30.0,
         max_concurrent: int = 2,
+        alpha_registry: AlphaRegistry | None = None,
     ) -> None:
         if max_polls < 1:
             raise ValueError("max_polls must be >= 1")
@@ -287,6 +328,7 @@ class BrainClient:
         self._base_poll_interval = base_poll_interval
         self._http_timeout = http_timeout
         self._max_concurrent = max_concurrent
+        self._alpha_registry = alpha_registry
         self._concurrency_semaphore = threading.BoundedSemaphore(max_concurrent)
         self._authenticated = False
         self._lock = threading.Lock()
@@ -325,6 +367,19 @@ class BrainClient:
         finally:
             self._concurrency_semaphore.release()
 
+        # Persist the raw alpha detail before computing fitness, so
+        # even individuals that end up FAILED are indexed. See D-155.
+        if (
+            sim.raw_alpha is not None
+            and self._alpha_registry is not None
+        ):
+            try:
+                self._alpha_registry.upsert_raw(sim.raw_alpha)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "alpha registry upsert failed: %s", e,
+                )
+
         metrics_dict = sim.metrics_dict()
 
         if sim.error_message is not None:
@@ -343,7 +398,12 @@ class BrainClient:
                 error=sim.error_message,
             )
 
-        fitness = self._fitness_fn(metrics_dict)
+        # Extract structured checks for the fitness function. See D-157.
+        checks: tuple[AlphaCheck, ...] | None = None
+        if sim.raw_alpha is not None:
+            checks = extract_checks(sim.raw_alpha)
+
+        fitness = self._fitness_fn(metrics_dict, checks)
         if fitness is None:
             log.info(
                 "%s",
@@ -597,7 +657,6 @@ class BrainClient:
                 )
                 return self._fetch_alpha_metrics(alpha_id)
 
-            # No status: {"progress": float}
             progress = data.get("progress")
             if progress is not None:
                 try:
@@ -616,7 +675,8 @@ class BrainClient:
             self._sleep_fn(self._next_poll_interval(resp))
 
         log.warning(
-            "[poll sim=%s] exceeded %d attempts", sim_id, self._max_polls,
+            "[poll sim=%s] exceeded %d attempts",
+            sim_id, self._max_polls,
         )
         raise BrainClientError(
             f"poll exceeded {self._max_polls} attempts"
@@ -670,6 +730,7 @@ class BrainClient:
         return SimulationResult(
             alpha_id=alpha_id,
             metrics=tuple(metrics),
+            raw_alpha=data,
         )
 
     def _next_poll_interval(self, resp: HttpResponse) -> float:
@@ -709,8 +770,9 @@ def _safe_text(resp: HttpResponse) -> str:
 def build_default_client(
     *,
     settings: BrainSettings | None = None,
-    fitness_fn: FitnessFunction = default_fitness,
+    fitness_fn: FitnessFunction = feasibility_fitness,
     max_concurrent: int = 2,
+    alpha_registry: AlphaRegistry | None = None,
 ) -> BrainClient:
     """Construct a BrainClient wired to real HTTP and environment creds."""
     return BrainClient(
@@ -719,4 +781,5 @@ def build_default_client(
         transport=RequestsTransport(),
         fitness_fn=fitness_fn,
         max_concurrent=max_concurrent,
+        alpha_registry=alpha_registry,
     )

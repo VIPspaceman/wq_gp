@@ -38,6 +38,8 @@ from wqgp.brain.client import (
     BrainCredentials,
     BrainSettings,
     build_default_client,
+    feasibility_fitness,
+    sharpe_only_fitness,
 )
 from wqgp.brain.pool_builder import (
     OperatorSignatureTable,
@@ -46,6 +48,7 @@ from wqgp.brain.pool_builder import (
     PoolBuilderProtocolError,
 )
 from wqgp.brain.transport import HttpTransport, RequestsTransport
+from wqgp.alpha_registry import AlphaRegistry
 from wqgp.budget import Budget
 from wqgp.cache import EvaluationCache
 from wqgp.checkpoint import CheckpointStore, CorruptCheckpointError
@@ -447,6 +450,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_run.add_argument(
+        "--fitness-strategy",
+        choices=("feasibility", "sharpe"),
+        default=None,
+        help=(
+            "fitness function: 'feasibility' (BRAIN checks first) or "
+            "'sharpe' (legacy). Default from config, else 'feasibility'. "
+            "See D-157."
+        ),
+    )
+    p_run.add_argument(
         "--no-cache", action="store_true",
         help=(
             "ignore the cross-run evaluation cache for this run: "
@@ -583,6 +596,8 @@ def _make_evaluator(
     args: argparse.Namespace,
     settings: Settings,
     evaluation_config: EvaluationConfig,
+    alpha_registry: AlphaRegistry | None = None,
+    run_cfg: dict[str, Any] | None = None,
 ) -> Evaluator:
     if args.dry_run:
         log.warning("dry-run mode: BRAIN will not be contacted")
@@ -596,8 +611,16 @@ def _make_evaluator(
     if max_concurrent is None:
         max_concurrent = settings.defaults.max_concurrent
 
+    fitness_fn = _resolve_fitness_fn(args, run_cfg or {})
+    log.info(
+        "fitness strategy: %s",
+        "sharpe" if fitness_fn is sharpe_only_fitness else "feasibility",
+    )
+
     return _build_client_with_creds(
         creds, evaluation_config, max_concurrent,
+        alpha_registry=alpha_registry,
+        fitness_fn=fitness_fn,
     )
 
 
@@ -605,6 +628,8 @@ def _build_client_with_creds(
     creds: BrainCredentials,
     evaluation_config: EvaluationConfig,
     max_concurrent: int,
+    alpha_registry: AlphaRegistry | None = None,
+    fitness_fn=feasibility_fitness,
 ):
     from wqgp.brain.client import BrainClient
     return BrainClient(
@@ -612,7 +637,21 @@ def _build_client_with_creds(
         settings=evaluation_config.settings,
         transport=RequestsTransport(),
         max_concurrent=max_concurrent,
+        alpha_registry=alpha_registry,
+        fitness_fn=fitness_fn,
     )
+
+
+def _resolve_fitness_fn(
+    args: argparse.Namespace, cfg: dict[str, Any]
+):
+    """Pick the fitness function from --fitness-strategy or config."""
+    raw = _pick(
+        args, cfg, "fitness_strategy", "fitness_strategy", "feasibility",
+    )
+    if raw == "sharpe":
+        return sharpe_only_fitness
+    return feasibility_fitness
 
 
 def _make_notifier(args: argparse.Namespace) -> Notifier:
@@ -859,7 +898,23 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.info("starting new run %s", run_cfg.run_id)
 
-    evaluator = _make_evaluator(args, settings, evaluation_config)
+    # Build or skip the alpha registry the same way as the cache:
+    # --no-cache disables both, and dry-run never touches it.
+    alpha_registry: AlphaRegistry | None = None
+    if (
+        not getattr(args, "no_cache", False)
+        and settings.cache.enabled
+        and not getattr(args, "dry_run", False)
+    ):
+        reg_path = run_cfg.checkpoint_root / "alphas.db"
+        reg_path.parent.mkdir(parents=True, exist_ok=True)
+        alpha_registry = AlphaRegistry(reg_path)
+
+    evaluator = _make_evaluator(
+        args, settings, evaluation_config,
+        alpha_registry=alpha_registry,
+        run_cfg=cfg,
+    )
     notifier = _make_notifier(args)
     cache = _make_cache(args, settings)
 
@@ -872,6 +927,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     finally:
         if cache is not None:
             cache.close()
+        if alpha_registry is not None:
+            alpha_registry.close()
 
     log.info(
         "run %s finished: reason=%s generation=%d total_simulations=%d "

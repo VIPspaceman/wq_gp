@@ -37,10 +37,10 @@ type signatures. The signature table is a hand-curated JSON file that
 supplies the rest. To see which operators BRAIN exposes that are
 missing from your table:
 
-    wqgp signatures --signatures signatures.json
+    wqgp signatures --signatures config/signatures.json
 
 Output lists missing operators and prints paste-ready JSON skeletons.
-Add the ones you need to `signatures.json`, then verify each signature
+Add the ones you need to `config/signatures.json`, then verify each signature
 against BRAIN's docs — the `"MATRIX"` placeholder is a guess.
 
 Use `--strict` in CI to fail when the table is incomplete.
@@ -48,7 +48,7 @@ Use `--strict` in CI to fail when the table is incomplete.
 ### 2. Build the pool
 
     wqgp build-pool \
-        --signatures signatures.json \
+        --signatures config/signatures.json \
         --output pool.json
 
 Fetches BRAIN's data fields and operator names, joins them with the

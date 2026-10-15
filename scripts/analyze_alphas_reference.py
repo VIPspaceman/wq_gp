@@ -4,7 +4,7 @@
 Usage:
     python scripts/analyze_alphas_reference.py \\
         [--reference data/alphas_reference.json] \\
-        [--signatures signatures.json] \\
+        [--signatures config/signatures.json] \\
         [--checkpoint-root ./checkpoints] \\
         [--report data/alphas_reference_analysis.json]
 
@@ -102,7 +102,7 @@ def main():
     parser.add_argument(
         "--reference", default="data/alphas_reference.json",
     )
-    parser.add_argument("--signatures", default="signatures.json")
+    parser.add_argument("--signatures", default="config/signatures.json")
     parser.add_argument("--checkpoint-root", default="./checkpoints")
     parser.add_argument(
         "--report", default="data/alphas_reference_analysis.json",
@@ -128,7 +128,7 @@ def main():
     supported = load_signatures(Path(args.signatures))
     print(
         f"loaded {len(supported)} supported operators from "
-        f"signatures.json"
+        f"config/signatures.json"
     )
     print(f"loaded {len(alphas)} alphas from {ref_path}")
     print()

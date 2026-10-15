@@ -4025,3 +4025,311 @@ Do NOT remove the protection until A/B data exists; the cost of
 keeping it is one less diverse elite, which is negligible.
 
 ---
+
+---
+
+## D-152 — Alpha registry is a separate SQLite file
+
+**Decision**: a new SQLite file `alphas.db` (default:
+`<checkpoint_root>/alphas.db`) indexes every BRAIN alpha the account
+has produced. It is independent from both the per-run evaluation DBs
+and the cross-run cache.
+
+**Why**: three different identity systems are now in play, and each
+needs its own storage with its own primary key.
+
+- Per-run DB: primary key `(run_id, fingerprint)` — "what did this
+  experiment evaluate".
+- Cache: primary key `(fingerprint, settings_hash)` — "has this exact
+  evaluation been done before".
+- Alpha registry: primary key `alpha_id` — "what alphas exist on the
+  platform right now".
+
+Forcing them together would mean one table with three partial
+constraints and no clear semantics. Keeping them apart means each
+query pattern maps cleanly to one table.
+
+The alternative — extending `EvaluationRecord` with the alpha_id and
+checks — was rejected. The two records describe different things: an
+evaluation is a local event that may or may not produce an alpha; an
+alpha is a platform artifact that persists independently of any local
+run and can be queried from a fresh process with no run context.
+
+**Revisit if**: a query needs to join across all three stores
+frequently (e.g. "which of my cache entries produced submittable
+alphas?"). Then a materialized view or a small denormalized table is
+justified. Do NOT collapse the stores into one file.
+
+---
+
+## D-153 — No cross-system fingerprint reconciliation
+
+**Decision**: the alpha registry does not attempt to relate a BRAIN
+alpha back to a local AST fingerprint. `alphas.db` has no
+`local_fingerprint` column and there is no code that tries to compute
+one.
+
+**Why**: local fingerprints are `SHA256(canonical(AST))`. BRAIN returns
+the expression as a text string in its own formatting
+(`(a)+(-1*b)` instead of `subtract(a, b)`, no spaces, outer parens).
+There is no reliable way to convert one into the other without a full
+BRAIN expression parser, which we deliberately do not have (see the
+Phase 4 Step 8 analysis).
+
+Attempting a best-effort match would silently associate some rows with
+the wrong local fingerprint when the two formats happen to coincide
+numerically, and would miss the rest. That is worse than not matching
+at all: a wrong match corrupts queries, a missing match is visible.
+
+Text-level matching is still possible when needed (normalize
+whitespace, strip outer parens, compare strings). That is a query-time
+operation, not a storage-time one.
+
+**Revisit if**: we eventually build a BRAIN expression parser (e.g. to
+ingest historical alphas as GP seeds). Then the parser becomes the
+bridge, and this decision is scoped to the parser's absence. Do NOT
+add a fuzzy-match column before the parser exists.
+
+---
+
+## D-154 — Checks are stored as structured tuples, not as a blob
+
+**Decision**: `AlphaCheck` is a frozen dataclass with fields
+`(name, result, limit, value, message)`. `AlphaRecord.checks` is a
+`tuple[AlphaCheck, ...]`. The registry stores this tuple as JSON in
+`checks_json`.
+
+**Why**: the goal of the registry is to answer questions like "how
+many alphas fail `LOW_SUB_UNIVERSE_SHARPE`?" and "which alphas have
+exactly one FAIL, close to threshold?". Storing checks as a JSON blob
+would make those questions expensive string-match operations on the
+whole column. Structured tuples let the query layer read one field.
+
+The JSON column is deliberate: SQLite has no first-class tuple type,
+and a separate `checks` table with one row per (alpha, check) pair
+would triple the storage for no query benefit at our scale (thousands
+of alphas, tens of checks each). JSON in a column is the standard
+compromise and works fine with the existing pattern-matching query
+helper.
+
+`result` is stored as a string (`"PASS"` / `"FAIL"` / `"PENDING"` /
+`"WARNING"`) rather than an enum, because BRAIN may add new values and
+we want old rows to keep loading without a schema bump.
+
+**Revisit if**: we start running SQL aggregations that need per-check
+filtering at the SQL level (e.g. "SELECT alphas WHERE check =
+'LOW_SHARPE' AND result = 'FAIL'"). Then a `checks` normalized table
+becomes justified. Measure first; the current queries run in Python
+over a few thousand rows in milliseconds.
+
+---
+
+## D-155 — BrainClient auto-upserts into the registry
+
+**Decision**: `BrainClient.__init__` accepts an optional
+`alpha_registry: AlphaRegistry`. When supplied, `__call__` upserts
+the raw `is` + `settings` + `checks` payload into the registry
+immediately after the simulation completes, before computing fitness.
+
+**Why**: without this, the registry only updates when someone runs
+`sync_alphas_history.py` manually. In practice that means the index
+is stale relative to the latest run and the user has to remember to
+run the sync script after every overnight job. Auto-writing closes
+that gap.
+
+The upsert happens BEFORE fitness computation on purpose: an alpha
+that fails every check and gets `fitness=None` is still a real
+platform artifact worth indexing. If we wrote after the fitness
+computation we would lose those rows, and the registry would not
+match what the account actually contains.
+
+Failures in the upsert do NOT propagate. A registry write error logs
+a warning and the simulation's TaskResult is still produced. The
+simulation cost has already been paid; letting a storage failure
+discard it would be a pure loss. This follows the same swallow-into-
+log pattern as D-034 and D-095.
+
+**Revisit if**: we need transactional consistency between the run DB
+and the alpha registry (e.g. a query that must see both updated or
+neither). Then the upsert moves into the Coordinator's merge step
+where both writes happen in the same pass. Do NOT make the registry
+write part of the TaskResult contract; TaskResult stays a value
+object.
+
+---
+
+## D-156 — FitnessFunction signature takes checks
+
+**Decision**: `FitnessFunction` becomes
+`Callable[[MetricsView, tuple[AlphaCheck, ...] | None], float | None]`.
+The second argument carries the structured `is.checks` from the
+alpha detail, or `None` when unavailable (legacy records, dry-run, or
+a BRAIN response missing the `is.checks` block).
+
+Two named implementations:
+
+- `feasibility_fitness` — the new default.
+- `sharpe_only_fitness` — the legacy behavior, preserved for A/B
+  comparison and for callers who explicitly want raw sharpe.
+
+`default_fitness` is an alias pointing at `feasibility_fitness`.
+
+**Why**: the checks are the difference between "high sharpe" and
+"submittable". A user running 300 simulations and getting a top-1 with
+`sub_sharpe=0.65 < 0.69` has wasted the entire run. The fitness
+function must see them.
+
+The `| None` second argument is deliberate. Old evaluation records
+were written before this change and do not carry checks. When the
+Coordinator absorbs such a record, the fitness function is called with
+`checks=None` and falls back to raw sharpe. This keeps old records
+self-consistent rather than treating them as zero-fitness failures.
+
+**Revisit if**: a second class of structured signal appears (e.g.
+`sector_exposure`). Then `FitnessFunction` gains a third argument or
+the argument becomes a small dataclass. Do NOT expand to a variable
+argument list; the fixed signature keeps call sites readable.
+
+---
+
+## D-157 — Feasibility-first fitness (three tiers)
+
+**Decision**: the default fitness is a three-tier scalar.
+
+    +1.00 .. +1.25   all relevant checks PASS
+    -0.25 .. +0.25   no FAIL, but some checks PENDING or missing
+    -inf  .. -1.00   at least one FAIL; closer to threshold is better
+
+Formally:
+
+    bonus   = 0.25 * tanh(sharpe / 2)
+    if any FAIL:
+        penalty = 1 + 0.25*len(fails) + sum(violation(c) for c in fails)
+        return -penalty + bonus
+    if any PENDING/WARNING:
+        return bonus
+    return 1 + bonus
+
+where `violation(c)` is the relative shortfall:
+`(limit - value) / |limit|` for `LOW_*` checks and
+`(value - limit) / |limit|` for `HIGH_*` checks, clamped to `[0, ...]`.
+Boolean checks without limit/value contribute a fixed `1.0`.
+
+`SELF_CORRELATION` is filtered out before the tier is computed,
+because it is `PENDING` at the GP stage; the platform resolves it at
+submission time and we have no way to know the outcome in advance.
+
+**Why three tiers instead of the naive `sharpe * ratio`**: the naive
+approach lets a very high sharpe on a FAILing alpha outrank a
+moderate-sharpe PASSing one. Concretely:
+
+- A: sharpe=3.0, sub_sharpe=0.5 (FAIL, limit=0.69)
+      naive = 3.0 * (0.5/0.69)^2 = 1.575
+- B: sharpe=1.0, all PASS
+      naive = 1.0 * 1.0 = 1.0
+
+A wins under the naive formula. But A cannot be submitted, and B can.
+Under the three-tier formula:
+
+- A = -1 - 0.25 - 0.275 + 0.235 = -1.29
+- B = 1 + 0.115 = 1.115
+
+B wins by a wide margin. The point of the run is B, not A.
+
+The tanh bonus bounds the sharpe contribution to `(-0.25, +0.25)` so
+that neither a very high sharpe nor a very negative one can cross a
+tier boundary. Tier membership is decided by the checks; sharpe only
+orders candidates *within* a tier.
+
+**Revisit if**: actual submissions show that the three-tier boundary
+is too coarse — e.g. PENDING alphas and PASS alphas are equally worth
+pursuing. Then collapse the middle tier into the top tier. Do NOT
+reintroduce the multiplicative penalty; the additive form is what
+keeps the tiers disjoint.
+
+---
+
+## D-158 — Fitness strategy is a CLI flag and a config key
+
+**Decision**: `wqgp run --fitness-strategy {feasibility,sharpe}`
+selects the fitness function. The config key is
+`fitness_strategy` at the top level of the run config. Precedence:
+flag > config > default (`"feasibility"`).
+
+`_resolve_fitness_fn` in `cli.py` is the single resolver. It returns
+either `feasibility_fitness` or `sharpe_only_fitness`.
+
+**Why**: A/B comparison requires running two configurations with
+nothing else changed. Without a flag, the switch would require editing
+`client.py` between runs, which is easy to forget and hard to audit
+later. A flag makes both the call and the log line explicit:
+
+    INFO wqgp.cli: fitness strategy: feasibility
+
+The default is `feasibility` because D-157 is the correct behavior for
+the stated goal ("maximize submittable alphas"). Legacy callers who
+need the old behavior can pin `--fitness-strategy sharpe` without
+losing the option to upgrade later.
+
+**Revisit if**: a third strategy appears (e.g. `feasibility_v2` with
+different tier boundaries). Then the flag's choice list expands and
+`_resolve_fitness_fn` gains a mapping. Do NOT add a numeric parameter
+to the existing feasibility function; each strategy is a separate
+named function.
+
+---
+
+---
+
+## D-159 — File layout reorganized; config/ subdirectory introduced
+
+**Decision**: after v0.10.0 the project root was reorganized.
+
+    wq_gp/
+    ├── .gitignore                 (root only)
+    ├── README.md                  (root only, GitHub convention)
+    ├── pyproject.toml             (root only, Python convention)
+    ├── requirements.txt           (root only)
+    ├── pool.json                  (build-pool output, root)
+    ├── config/
+    │   ├── wqgp.json              (contains credentials; gitignored)
+    │   ├── wqgp.schema.json       (committed)
+    │   └── signatures.json        (committed)
+    ├── docs/
+    │   ├── DECISIONS.md
+    │   └── cmd.txt
+    ├── data/
+    │   ├── alphas_reference.json          (gitignored)
+    │   ├── alphas_reference_analysis.json (gitignored)
+    │   └── archive/                       (gitignored)
+    ├── checkpoints/                       (gitignored; DBs live here)
+    ├── logs/                              (gitignored)
+    ├── scripts/
+    ├── src/
+    └── tests/
+
+**Why**: the root directory had grown to contain configuration
+(`wqgp.json`, `signatures.json`, `wqgp.schema.json`), documentation
+(`DECISIONS.md`, `cmd.txt`, a stray `DECISIONS copy.md`), a
+regeneratable artifact (`alphas_probe.json`), and a helper script
+(`run_ab.sh`). None of these needed to be at the root; only
+`.gitignore`, `README.md`, `pyproject.toml`, and `requirements.txt`
+are pinned there by convention.
+
+`.gitignore` was updated to ignore only `config/wqgp.json` (the file
+that contains credentials) rather than the whole `config/` directory.
+The earlier `.gitignore` had a bare `config/` line that would have
+prevented `signatures.json` and `wqgp.schema.json` from being
+committed — a silent data-loss risk for a fresh clone.
+
+**Note on D-135**: that entry describes `wqgp.json` as living "in the
+project root". This is now stale. The intent of D-135 (a JSON
+settings file with a credentials block) is unchanged; only the path
+moved. `wqgp run --settings config/wqgp.json` is the new invocation.
+
+**Revisit if**: a second project (e.g. a research branch) needs a
+separate config tree. Then the config path becomes a per-project
+setting rather than a fixed convention. Do NOT reintroduce config
+files at the root.
+
+---

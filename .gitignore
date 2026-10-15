@@ -1,5 +1,5 @@
 # Secrets
-wqgp.json
+config/wqgp.json
 
 # Python
 __pycache__/
@@ -7,14 +7,17 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # Project artifacts
-checkpoints/
+data/archive/
 logs/
+checkpoints/
 *.db
 *.db-wal
 *.db-shm
 pool.json
 
 # Reference data (regeneratable from BRAIN API)
-data/
+data/alphas_reference.json
+data/alphas_reference_analysis.json
