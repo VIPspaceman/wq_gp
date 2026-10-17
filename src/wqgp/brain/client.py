@@ -21,8 +21,8 @@ Design decisions:
 - All logs go to "wqgp.brain". Poll logs carry the sim id. See D-134.
 - When an AlphaRegistry is supplied, every successful simulation's
   raw alpha detail is upserted into it. See D-155.
-- The default fitness is feasibility-first: checks take priority over
-  raw sharpe. See D-157.
+- The default fitness is sharpe-first with soft-tier constraints.
+  See D-163.
 """
 from __future__ import annotations
 
@@ -100,6 +100,14 @@ FitnessFunction = Callable[
 ]
 
 
+# v3 fitness parameters. See D-163.
+_FAIL_BASE_PENALTY = 0.35
+_VIOLATION_PENALTY = 0.5
+_VIOLATION_CAP = 2.0
+_PASS_BONUS = 4.0
+_PENDING_MULTIPLIER = 0.5
+
+
 def _check_violation(check: AlphaCheck) -> float:
     """How badly a FAILed check missed its threshold.
 
@@ -130,12 +138,7 @@ def sharpe_only_fitness(
 ) -> float | None:
     """Legacy fitness: return sharpe, ignore checks.
 
-    Kept for `--fitness-strategy sharpe` and for callers that want the
-    pre-D-157 behavior.
-
-    Rejects NaN, +/-inf, and bool. bool is checked before the float()
-    call because bool is a subclass of int and float(True) == 1.0,
-    which would silently pass a bool off as a valid sharpe.
+    Kept for `--fitness-strategy sharpe` and for A/B comparison.
     """
     sharpe = metrics.get("sharpe")
     if sharpe is None:
@@ -155,16 +158,32 @@ def feasibility_fitness(
     metrics: MetricsView,
     checks: tuple[AlphaCheck, ...] | None = None,
 ) -> float | None:
-    """Feasibility-first scalar fitness. See D-157.
+    """Sharpe-first fitness with soft-tier constraint penalties.
 
-    Three tiers:
-      +1.00 .. +1.25   all relevant checks PASS
-      -0.25 .. +0.25   no FAIL, but some checks pending/missing
-      -inf  .. -1.00   at least one FAIL; closer to threshold is better
+    Replaces the three-tier formula from D-157 with a formula that
+    keeps sharpe as the dominant axis while still preferring
+    submittable alphas. See D-163.
 
-    When `checks` is None or empty, falls back to raw sharpe so that
-    evaluation records written before D-157 remain comparable within
-    themselves.
+    Behavior:
+      - Sharpe is the base score, not compressed by tanh.
+      - No FAIL, no PENDING: score = sharpe + 4.0.
+      - No FAIL, at least one PENDING/WARNING:
+        score = sharpe + 2.0.
+      - At least one FAIL:
+        score = sharpe - 0.35 * n_fails
+                     - 0.5 * sum(min(violation, 2.0))
+
+    Effect on the A/B failure modes seen in D-162:
+      - A submittable alpha with sharpe=0.5 lands at 4.5.
+      - A non-submittable alpha with sharpe=1.35 and one FAIL lands
+        at ~0.85. The submittable one wins, but the non-submittable
+        one is not annihilated; it still competes on the basis of
+        its sharpe within the FAIL tier.
+      - Inside the PASS tier, sharpe differences are preserved in
+        full (a pass at 1.30 vs 0.50 differ by 0.80, not 0.12).
+
+    `checks` may be None for records written before D-156. In that
+    case the function falls back to raw sharpe.
     """
     sharpe = metrics.get("sharpe")
     if sharpe is None:
@@ -186,31 +205,25 @@ def feasibility_fitness(
     if not relevant:
         return sharpe
 
-    sharpe_bonus = 0.25 * math.tanh(sharpe / 2.0)
-
     failures = tuple(c for c in relevant if c.failed)
-    pending = tuple(
-        c for c in relevant
-        if c.result in ("PENDING", "WARNING")
-    )
-
     if failures:
-        violation = sum(_check_violation(c) for c in failures)
-        return (
-            -1.0
-            - 0.25 * len(failures)
-            - violation
-            + sharpe_bonus
-        )
+        score = sharpe
+        for check in failures:
+            score -= _FAIL_BASE_PENALTY
+            gap = _check_violation(check)
+            score -= _VIOLATION_PENALTY * min(gap, _VIOLATION_CAP)
+        return score
 
-    if pending:
-        return sharpe_bonus
+    has_pending = any(
+        c.result in ("PENDING", "WARNING") for c in relevant
+    )
+    if has_pending:
+        return sharpe + _PASS_BONUS * _PENDING_MULTIPLIER
+    return sharpe + _PASS_BONUS
 
-    return 1.0 + sharpe_bonus
 
-
-# The default is feasibility-first. Kept as a named alias for callers
-# that import default_fitness by name.
+# The default is the v3 formula (formerly called "feasibility"; the
+# name is kept for backward compatibility with --fitness-strategy).
 default_fitness = feasibility_fitness
 
 
@@ -367,8 +380,6 @@ class BrainClient:
         finally:
             self._concurrency_semaphore.release()
 
-        # Persist the raw alpha detail before computing fitness, so
-        # even individuals that end up FAILED are indexed. See D-155.
         if (
             sim.raw_alpha is not None
             and self._alpha_registry is not None
@@ -398,7 +409,6 @@ class BrainClient:
                 error=sim.error_message,
             )
 
-        # Extract structured checks for the fitness function. See D-157.
         checks: tuple[AlphaCheck, ...] | None = None
         if sim.raw_alpha is not None:
             checks = extract_checks(sim.raw_alpha)

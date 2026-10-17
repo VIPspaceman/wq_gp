@@ -20,7 +20,7 @@ from wqgp.brain.settings import BrainSettings
 
 # Bump this when the meaning of a cache key changes. Old keys remain
 # in the cache DB and are simply never matched again. See D-140.
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)

@@ -35157,12 +35157,6 @@
           "min_value": 1,
           "max_value": 512,
           "default": 120
-        },
-        "k": {
-          "kind": "INT_RANGE",
-          "min_value": 1,
-          "max_value": 10,
-          "default": 1
         }
       }
     },

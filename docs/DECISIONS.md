@@ -4372,3 +4372,147 @@ and `_fitness_fn_for`. Do NOT add a per-strategy version prefix; the
 current single version constant is enough.
 
 ---
+
+---
+
+## D-161 — Run checkpoints live under <root>/runs/<run_id>/
+
+**Decision**: `CheckpointStore` writes run checkpoints to
+`<root>/runs/<run_id>/step_NNNNNN.json` and
+`<root>/runs/<run_id>/latest.txt`. Run DBs also live in
+`<root>/runs/<run_id>.db`. The cache (`cache.db`) and alpha registry
+(`alphas.db`) stay at `<root>/` root.
+
+**Why**: `checkpoint_root` was holding three unrelated kinds of data
+in the same directory: cache, alpha registry, and per-run artifacts
+(JSON checkpoints plus DBs). When listing the directory, the cache
+and registry were indistinguishable from run files. After D-159 moved
+source files around, the directory listing was still confusing.
+
+The layout after this decision:
+
+    checkpoints/
+    ├── cache.db                  # cross-run evaluation cache
+    ├── alphas.db                 # BRAIN alpha index
+    └── runs/
+        ├── <run_id>.db
+        ├── <run_id>/
+        │   ├── step_NNNNNN.json
+        │   └── latest.txt
+        └── ...
+
+Three store types, three visibly distinct locations.
+
+This required changes in two places:
+
+1. `CheckpointStore` (D-014 / D-015 code) now prefixes every run path
+   with `runs/`. The cache and registry are unaware of this.
+2. `Coordinator._initial_setup` now defaults the run DB to
+   `<root>/runs/<run_id>.db` instead of `<root>/<run_id>.db`.
+
+Existing data was migrated by hand (files moved into `runs/`, then
+tests updated to assert the new paths). No production code had to
+handle the old layout.
+
+**Revisit if**: a fourth type of artifact appears at the root that
+also needs isolation. Do NOT add a new subdirectory per artifact type
+preemptively; group first, isolate later when the pattern is clear.
+
+---
+
+## D-162 — Resume validates the budget against the checkpoint
+
+**Decision**: `Coordinator._resume_setup` compares the checkpoint's
+`total_simulations_used` against the new run's budget. If `used >
+limit`, it raises `CoordinatorError` with a message that names the
+used count, the new limit, and both remediation options.
+
+**Why**: `BudgetTracker.__init__` already rejects `used > limit` with
+a `ValueError`, but the Coordinator's `run()` calls `_setup()` before
+its `try` block, so that `ValueError` bypassed the `except
+CoordinatorError` handler in `cli._cmd_run` and landed in `main`'s
+catch-all. The user saw:
+
+    unexpected error: total_simulations_used=195 outside [0, 5]
+
+That message is technically true but does not tell the user what to
+do. The correct action in every such case is the same: raise the
+budget above the used count, or delete the checkpoint to start fresh.
+
+The new message says both, with the exact paths:
+
+    cannot resume run 'overnight_2' from generation 29:
+    it has already used 195 simulations, but the new budget only
+    allows 5. Increase --total-simulations to at least 195,
+    or delete the checkpoint at checkpoints/runs/overnight_2/
+    to start fresh.
+
+**Revisit if**: a future mode wants to "extend" a run's budget without
+touching the checkpoint (e.g. a research run that is deliberately
+re-simulating to observe drift). Then that mode gets its own flag and
+its own validation path. Do NOT weaken this check; the invariant
+"used <= limit" is what keeps the tracker honest.
+
+---
+
+## D-163 — v3 fitness: sharpe-first with soft-tier constraints
+
+**Decision**: replace the three-tier formula of D-157 with a new
+formula that keeps sharpe as the dominant axis while still
+preferring submittable alphas.
+
+    FAIL tier:     score = sharpe - 0.35*n_fails
+                           - 0.5 * sum(min(violation, 2.0))
+    PENDING tier:  score = sharpe + 2.0
+    PASS tier:     score = sharpe + 4.0
+
+`SELF_CORRELATION` continues to be ignored at the GP stage.
+`CACHE_SCHEMA_VERSION` goes from 1 to 2 so old cache entries do not
+match.
+
+**Why**: D-157 compressed sharpe into `0.25 * tanh(sharpe/2)`, an
+interval of `[-0.25, +0.25]`, to guarantee a strict tier ordering.
+The A/B in D-162 showed the consequence:
+
+- feasibility group: top-1 sharpe=0.78, turnover=0.036, fitness=-2.26
+  (2 FAILs still present; the formula tilted the search toward
+  turnover avoidance at the cost of sharpe)
+- recent 120 alphas: 116 fail LOW_SHARPE (96.7%), 0 submittable
+
+The same data showed the other direction:
+
+- sharpe group: top-1 sharpe=1.35, turnover=0.915
+
+So the two fitness strategies were dragging the search into two
+different corners of the (sharpe, turnover) plane, both wrong. The
+issue was not the weight of one constraint; it was that the tanh
+compression left almost no selection pressure on sharpe at all.
+Within the PASS tier, a sharpe of 1.30 and a sharpe of 0.50 differed
+by 0.12 in the old formula, effectively no signal.
+
+v3 fixes this by making sharpe the base score and adding a finite
+bonus/penalty for check status. The 4.0 PASS bonus is large enough
+that a submittable alpha with sharpe 0.5 (score 4.5) still beats a
+1-FAIL alpha with sharpe 3.0 (score 2.4). Within each tier, sharpe
+differences appear at full scale (0.80, not 0.12).
+
+The 4.0 bonus is a calibration parameter, not a theoretical constant.
+It should be revisited after the next A/B run if pass-tier alphas
+crowd out fail-tier alphas too aggressively, or if the reverse
+happens.
+
+Empirical measurement from `measure_field_vs_subsharpe.py` (see
+D-162 follow-up) showed that when an alpha passes all non-sub checks,
+it passes the sub check 95.7% of the time. The dominant failure mode
+is therefore not `LOW_SUB_UNIVERSE_SHARPE` but `LOW_SHARPE` and
+`LOW_FITNESS`. v3 is designed to attack the dominant failure mode
+directly, not to fix an imaginary diversity problem.
+
+**Revisit if**: the next A/B shows that v3 still lets the search
+drift toward high-turnover or high-sharpe-but-failing corners. That
+would indicate the violation cap (2.0) or the base penalty (0.35) is
+too permissive, and both are candidates for tuning. Do NOT revert to
+a multiplicative penalty; the failure mode of multiplication is
+documented in D-157 and was observed in the D-162 A/B.
+
+---

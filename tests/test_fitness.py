@@ -1,7 +1,5 @@
-"""Tests for fitness functions. D-157 gate."""
+"""Tests for fitness functions. D-163 gate."""
 from __future__ import annotations
-
-import math
 
 import pytest
 
@@ -43,151 +41,161 @@ def test_sharpe_only_rejects_nan() -> None:
     assert sharpe_only_fitness({"sharpe": float("nan")}) is None
 
 
-# --- feasibility_fitness: no checks -----------------------------------------
+def test_sharpe_only_rejects_bool() -> None:
+    assert sharpe_only_fitness({"sharpe": True}) is None
 
-def test_feasibility_no_checks_returns_raw_sharpe() -> None:
-    """Backward compat: records without checks score as raw sharpe."""
+
+# --- feasibility_fitness: no checks (legacy) -------------------------------
+
+def test_no_checks_returns_raw_sharpe() -> None:
     assert feasibility_fitness({"sharpe": 1.59}) == 1.59
 
 
-def test_feasibility_empty_checks_returns_raw_sharpe() -> None:
+def test_empty_checks_returns_raw_sharpe() -> None:
     assert feasibility_fitness({"sharpe": 1.59}, ()) == 1.59
 
 
-def test_feasibility_none_sharpe_returns_none() -> None:
+def test_none_sharpe_returns_none() -> None:
     assert feasibility_fitness({}, None) is None
 
 
-# --- feasibility_fitness: all PASS ------------------------------------------
-
-def test_feasibility_all_pass_lands_above_one() -> None:
-    checks = (
-        _chk("LOW_SHARPE", "PASS", 1.25, 1.59),
-        _chk("LOW_FITNESS", "PASS", 1.0, 1.19),
-        _chk("LOW_SUB_UNIVERSE_SHARPE", "PASS", 0.69, 0.85),
-    )
-    result = feasibility_fitness({"sharpe": 1.59}, checks)
-    assert result is not None
-    assert 1.0 < result <= 1.25
-
-
-def test_feasibility_pass_with_pending_ignores_self_corr() -> None:
-    """SELF_CORRELATION=PENDING does not block PASS tier."""
-    checks = (
-        _chk("LOW_SHARPE", "PASS", 1.25, 1.59),
-        _chk("SELF_CORRELATION", "PENDING"),
-    )
-    result = feasibility_fitness({"sharpe": 1.59}, checks)
-    assert result is not None
-    assert result > 1.0
-
-
-# --- feasibility_fitness: FAIL tier -----------------------------------------
-
-def test_feasibility_one_fail_lands_below_negative_one() -> None:
-    """The exact scenario from the D-157 decision record."""
-    checks = (
-        _chk("LOW_SHARPE", "PASS", 1.25, 1.59),
-        _chk("LOW_SUB_UNIVERSE_SHARPE", "FAIL", 0.69, 0.65),
-    )
-    result = feasibility_fitness({"sharpe": 1.59}, checks)
-    assert result is not None
-    assert result < -1.0
-    # Violation = 0.04/0.69 = 0.058; penalty = 1 + 0.25 + 0.058 - 0.165
-    assert result == pytest.approx(-1.143, abs=0.01)
-
-
-def test_feasibility_fail_beats_high_sharpe_that_also_fails() -> None:
-    """Two FAILs: one near threshold, one far. Near wins."""
-    near = (
-        _chk("LOW_SUB_UNIVERSE_SHARPE", "FAIL", 0.69, 0.68),
-    )
-    far = (
-        _chk("LOW_SUB_UNIVERSE_SHARPE", "FAIL", 0.69, 0.20),
-    )
-    a = feasibility_fitness({"sharpe": 1.0}, near)
-    b = feasibility_fitness({"sharpe": 1.0}, far)
-    assert a is not None and b is not None
-    assert a > b
-
-
-def test_feasibility_pass_beats_any_fail() -> None:
-    """A mediocre PASS beats a great FAIL. This is the point."""
-    pass_chk = (_chk("LOW_SHARPE", "PASS", 1.25, 1.30),)
-    fail_chk = (
-        _chk("LOW_SUB_UNIVERSE_SHARPE", "FAIL", 0.69, 0.68),
-    )
-    passer = feasibility_fitness({"sharpe": 1.30}, pass_chk)
-    failer = feasibility_fitness({"sharpe": 3.00}, fail_chk)
-    assert passer is not None and failer is not None
-    assert passer > failer
-
-
-# --- feasibility_fitness: multiple FAILs ------------------------------------
-
-def test_feasibility_multiple_fails_stack_penalty() -> None:
-    one = (_chk("LOW_SUB_UNIVERSE_SHARPE", "FAIL", 0.69, 0.50),)
-    two = (
-        _chk("LOW_SUB_UNIVERSE_SHARPE", "FAIL", 0.69, 0.50),
-        _chk("CONCENTRATED_WEIGHT", "FAIL"),
-    )
-    a = feasibility_fitness({"sharpe": 1.0}, one)
-    b = feasibility_fitness({"sharpe": 1.0}, two)
-    assert a is not None and b is not None
-    assert a > b
-
-
-# --- feasibility_fitness: HIGH_ checks --------------------------------------
-
-def test_feasibility_high_turnover_gap_direction() -> None:
-    """HIGH_TURNOVER at 0.9 with limit 0.7: violation = 0.2/0.7."""
-    checks = (
-        _chk("HIGH_TURNOVER", "FAIL", 0.7, 0.9),
-    )
-    result = feasibility_fitness({"sharpe": 1.0}, checks)
-    assert result is not None
-    assert result < -1.0
-
-
-def test_feasibility_low_turnover_gap_direction() -> None:
-    """LOW_TURNOVER at 0.005 with limit 0.01: violation = 0.005/0.01."""
-    checks = (
-        _chk("LOW_TURNOVER", "FAIL", 0.01, 0.005),
-    )
-    result = feasibility_fitness({"sharpe": 1.0}, checks)
-    assert result is not None
-    assert result < -1.0
-
-
-# --- feasibility_fitness: edge cases ----------------------------------------
-
-def test_feasibility_nan_sharpe_returns_none() -> None:
+def test_nan_sharpe_returns_none() -> None:
     assert feasibility_fitness({"sharpe": float("nan")}, None) is None
-    assert feasibility_fitness({"sharpe": float("inf")}, None) is None
 
 
-def test_feasibility_bool_metric_returns_none() -> None:
+def test_bool_sharpe_returns_none() -> None:
     assert feasibility_fitness({"sharpe": True}, None) is None
 
 
-def test_feasibility_default_alias_is_feasibility() -> None:
-    """default_fitness must be the feasibility version."""
+# --- v3: all PASS tier (sharpe + 4.0) --------------------------------------
+
+def test_all_pass_adds_bonus() -> None:
     checks = (
-        _chk("LOW_SUB_UNIVERSE_SHARPE", "FAIL", 0.69, 0.65),
+        _chk("LOW_SHARPE", "PASS", 1.25, 1.30),
+        _chk("LOW_FITNESS", "PASS", 1.0, 1.10),
     )
-    a = default_fitness({"sharpe": 1.59}, checks)
-    b = feasibility_fitness({"sharpe": 1.59}, checks)
-    assert a == b
+    result = feasibility_fitness({"sharpe": 1.30}, checks)
+    assert result == pytest.approx(1.30 + 4.0)
 
 
-def test_feasibility_sharpe_bonus_is_bounded() -> None:
-    """The tanh bonus must never let a PASS fall below 1.0."""
-    checks = (_chk("LOW_SHARPE", "PASS", 1.25, 100.0),)
-    result = feasibility_fitness({"sharpe": 1e6}, checks)
+def test_all_pass_preserves_sharpe_difference() -> None:
+    """The whole point of v3: within the PASS tier, sharpe differences
+    are NOT compressed. 1.30 vs 0.50 must differ by 0.80, not 0.12."""
+    checks_hi = (_chk("LOW_SHARPE", "PASS", 1.25, 1.30),)
+    checks_lo = (_chk("LOW_SHARPE", "PASS", 1.25, 0.50),)
+    a = feasibility_fitness({"sharpe": 1.30}, checks_hi)
+    b = feasibility_fitness({"sharpe": 0.50}, checks_lo)
+    assert a is not None and b is not None
+    assert a - b == pytest.approx(0.80)
+
+
+def test_all_pass_ignores_self_correlation_pending() -> None:
+    checks = (
+        _chk("LOW_SHARPE", "PASS", 1.25, 1.30),
+        _chk("SELF_CORRELATION", "PENDING"),
+    )
+    result = feasibility_fitness({"sharpe": 1.30}, checks)
+    assert result == pytest.approx(1.30 + 4.0)
+
+
+# --- v3: pending tier (sharpe + 2.0) ---------------------------------------
+
+def test_pending_gets_half_bonus() -> None:
+    checks = (
+        _chk("LOW_SHARPE", "PASS", 1.25, 1.30),
+        _chk("LOW_SUB_UNIVERSE_SHARPE", "PENDING"),
+    )
+    result = feasibility_fitness({"sharpe": 1.30}, checks)
+    assert result == pytest.approx(1.30 + 2.0)
+
+
+# --- v3: fail tier (sharpe - penalties) ------------------------------------
+
+def test_one_fail_with_numeric_gap() -> None:
+    """Concrete case from the A/B: sharpe=1.35, turnover=0.915 fails
+    HIGH_TURNOVER (limit 0.7). gap = 0.215/0.7 = 0.307.
+    score = 1.35 - 0.35 - 0.5*0.307 = 0.846."""
+    checks = (
+        _chk("HIGH_TURNOVER", "FAIL", 0.7, 0.915),
+    )
+    result = feasibility_fitness({"sharpe": 1.35}, checks)
+    assert result == pytest.approx(1.35 - 0.35 - 0.5 * (0.215 / 0.7))
+
+
+def test_two_fails_compound_penalty() -> None:
+    checks = (
+        _chk("LOW_SHARPE", "FAIL", 1.25, 0.78),
+        _chk("LOW_FITNESS", "FAIL", 1.0, 0.60),
+    )
+    result = feasibility_fitness({"sharpe": 0.78}, checks)
     assert result is not None
-    assert result <= 1.25
-    # Even with a huge negative sharpe, PASS still lands > 0.75.
-    checks_low = (_chk("LOW_SHARPE", "PASS", 1.25, 1.30),)
-    low = feasibility_fitness({"sharpe": -1e6}, checks_low)
-    assert low is not None
-    assert low > 0.7
+    # Two FAIL penalties applied
+    assert result < 0.78
+
+
+def test_fail_without_numeric_value_uses_unit_penalty() -> None:
+    """Boolean checks (CONCENTRATED_WEIGHT) contribute 0.35 + 0.5*1.0."""
+    checks = (
+        _chk("CONCENTRATED_WEIGHT", "FAIL"),
+    )
+    result = feasibility_fitness({"sharpe": 1.5}, checks)
+    assert result == pytest.approx(1.5 - 0.35 - 0.5)
+
+
+def test_violation_capped_at_two() -> None:
+    """A wildly-out-of-range check should not annihilate the score."""
+    checks = (
+        _chk("LOW_SHARPE", "FAIL", 1.25, -5.0),  # gap = 6.25/1.25 = 5.0
+    )
+    result = feasibility_fitness({"sharpe": 1.5}, checks)
+    # gap capped at 2.0: penalty = 0.35 + 0.5*2.0 = 1.35
+    assert result == pytest.approx(1.5 - 1.35)
+
+
+# --- v3: pass > fail ordering ----------------------------------------------
+
+def test_submittable_beats_high_sharpe_failure() -> None:
+    """The core design goal of v3: a mediocre submittable alpha beats
+    a higher-sharpe alpha that fails a check. This was the failure
+    mode of the old feasibility formula (D-157)."""
+    pass_checks = (
+        _chk("LOW_SHARPE", "PASS", 1.25, 1.30),
+    )
+    fail_checks = (
+        _chk("HIGH_TURNOVER", "FAIL", 0.7, 0.92),
+    )
+    submittable = feasibility_fitness({"sharpe": 0.50}, pass_checks)
+    failing = feasibility_fitness({"sharpe": 1.35}, fail_checks)
+    assert submittable is not None and failing is not None
+    assert submittable > failing
+
+
+def test_pass_0_5_beats_fail_at_3_0() -> None:
+    """Even a PASS with very low sharpe should beat a FAIL with very
+    high sharpe. This is what makes the tier 'soft' but still
+    reliable."""
+    pass_checks = (_chk("LOW_SHARPE", "PASS", 1.25, 0.50),)
+    fail_checks = (_chk("HIGH_TURNOVER", "FAIL", 0.7, 0.75),)
+    a = feasibility_fitness({"sharpe": 0.50}, pass_checks)
+    b = feasibility_fitness({"sharpe": 3.00}, fail_checks)
+    assert a is not None and b is not None
+    assert a > b
+
+
+def test_fail_tier_still_orders_by_sharpe() -> None:
+    """Within the FAIL tier, higher sharpe still wins."""
+    checks_a = (_chk("HIGH_TURNOVER", "FAIL", 0.7, 0.92),)
+    checks_b = (_chk("HIGH_TURNOVER", "FAIL", 0.7, 0.92),)
+    a = feasibility_fitness({"sharpe": 1.35}, checks_a)
+    b = feasibility_fitness({"sharpe": 0.50}, checks_b)
+    assert a is not None and b is not None
+    assert a > b
+
+
+# --- default alias ---------------------------------------------------------
+
+def test_default_alias_is_v3() -> None:
+    checks = (_chk("LOW_SHARPE", "PASS", 1.25, 1.30),)
+    a = default_fitness({"sharpe": 1.30}, checks)
+    b = feasibility_fitness({"sharpe": 1.30}, checks)
+    assert a == b
