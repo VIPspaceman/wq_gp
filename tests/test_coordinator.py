@@ -90,6 +90,7 @@ def _config(
         checkpoint_root=tmp_path / "ckpt",
         evaluation_db=tmp_path / "eval.db",
         n_workers=2,
+        seed_count=0,
     )
 
 

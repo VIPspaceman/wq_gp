@@ -191,6 +191,7 @@ def test_build_pool_missing_credentials(
 def test_run_missing_pool(tmp_path: Path) -> None:
     code = cli.main([
         "run",
+        "--seed-count", "0",
         "--run-id", "r1",
         "--total-simulations", "10",
         "--dry-run",
@@ -203,6 +204,7 @@ def test_run_missing_run_id(tmp_path: Path) -> None:
     pool_path = _write_pool(tmp_path / "pool.json")
     code = cli.main([
         "run",
+        "--seed-count", "0",
         "--pool", str(pool_path),
         "--total-simulations", "10",
         "--dry-run",
@@ -215,6 +217,7 @@ def test_run_missing_budget(tmp_path: Path) -> None:
     pool_path = _write_pool(tmp_path / "pool.json")
     code = cli.main([
         "run",
+        "--seed-count", "0",
         "--pool", str(pool_path),
         "--run-id", "r1",
         "--dry-run",
@@ -229,6 +232,7 @@ def test_run_dry_run_end_to_end(tmp_path: Path) -> None:
 
     code = cli.main([
         "run",
+        "--seed-count", "0",
         "--pool", str(pool_path),
         "--run-id", "smoke",
         "--total-simulations", "20",
@@ -263,6 +267,7 @@ def test_run_config_file_provides_defaults(tmp_path: Path) -> None:
 
     code = cli.main([
         "run",
+        "--seed-count", "0",
         "--config", str(cfg_path),
         "--dry-run",
     ])
@@ -285,6 +290,7 @@ def test_run_flag_overrides_config(tmp_path: Path) -> None:
 
     code = cli.main([
         "run",
+        "--seed-count", "0",
         "--config", str(cfg_path),
         "--run-id", "overridden",
         "--max-generations", "1",
@@ -301,6 +307,7 @@ def test_run_invalid_config_json(tmp_path: Path) -> None:
     cfg_path.write_text("{ not json")
     code = cli.main([
         "run",
+        "--seed-count", "0",
         "--config", str(cfg_path),
         "--dry-run",
         "--pool", str(tmp_path / "pool.json"),
@@ -316,6 +323,7 @@ def test_run_config_root_not_object(tmp_path: Path) -> None:
     cfg_path.write_text(json.dumps([1, 2, 3]))
     code = cli.main([
         "run",
+        "--seed-count", "0",
         "--config", str(cfg_path),
         "--dry-run",
         "--pool", str(tmp_path / "pool.json"),
@@ -355,6 +363,7 @@ def test_list_runs_shows_runs(capsys, tmp_path: Path) -> None:
     for rid in ("alpha", "beta"):
         code = cli.main([
             "run",
+            "--seed-count", "0",
             "--pool", str(pool_path),
             "--run-id", rid,
             "--total-simulations", "20",

@@ -6,16 +6,16 @@ Design decisions:
 - A mutation must change the fingerprint or it is retried. See D-047.
 - Operator swap requires matching parameter names. See D-048.
 - Subtree swap uses a small-budget builder. See D-049.
-- AST traversal and replacement utilities now live in ast.py. See D-051.
-
-This module does NOT evaluate, does NOT talk to BRAIN, and does NOT
-carry state between calls. `Mutator` is a thin dispatcher that tries
-strategies in random order until one produces a distinct fingerprint.
+- AST traversal utilities live in ast.py. See D-051.
+- `mutate_field_weighted` mirrors `mutate_field` but samples with
+  inverse-frequency weighting when the caller supplies a field_usage
+  map. The Mutator picks the weighted variant automatically when a
+  map is present. See D-165.
 """
 from __future__ import annotations
 
 import random
-from typing import Callable
+from typing import Callable, Mapping
 
 from wqgp.ast import (
     ASTNode,
@@ -32,13 +32,9 @@ from wqgp.population import GenerationError, RandomAstBuilder
 from wqgp.types import DataType, ParamDomain, ParamKind
 
 
-# --- errors -----------------------------------------------------------------
-
 class MutationError(RuntimeError):
     """Raised when no strategy produced a distinct-fingerprint AST."""
 
-
-# --- input-type compatibility (mirrors ASTNode._compatible) -----------------
 
 _NUMERIC_TYPES = frozenset(
     {DataType.MATRIX, DataType.VECTOR, DataType.SCALAR}
@@ -60,8 +56,6 @@ def _inputs_compatible(
     return True
 
 
-# --- param sampling (shared with population.py semantics) ------------------
-
 def _sample_param(
     dom: ParamDomain, rng: random.Random
 ) -> int | float | str:
@@ -78,7 +72,11 @@ def _sample_param(
     raise MutationError(f"unknown param kind: {dom.kind!r}")
 
 
-# --- strategies -------------------------------------------------------------
+# Same clamp values as population.py; see D-165.
+_FIELD_WEIGHT_ALPHA = 0.5
+_FIELD_WEIGHT_MIN = 0.25
+_FIELD_WEIGHT_MAX = 4.0
+
 
 Strategy = Callable[[ASTNode, Pool, random.Random], ASTNode | None]
 
@@ -86,7 +84,6 @@ Strategy = Callable[[ASTNode, Pool, random.Random], ASTNode | None]
 def mutate_window(
     ast: ASTNode, pool: Pool, rng: random.Random
 ) -> ASTNode | None:
-    """Resample one integer or float parameter of a CALL node."""
     candidates: list[tuple[Path, int, ParamDomain]] = []
     for path, node in iter_calls(ast):
         assert node.op_def is not None
@@ -97,7 +94,6 @@ def mutate_window(
         return None
 
     path, idx, dom = rng.choice(candidates)
-    # Walk to the node to read the current value.
     node = ast
     for step in path:
         node = node.children[step]
@@ -114,7 +110,7 @@ def mutate_window(
 def mutate_field(
     ast: ASTNode, pool: Pool, rng: random.Random
 ) -> ASTNode | None:
-    """Swap one FIELD_REF for another field of the same DataType."""
+    """Uniform field swap: same-type field, random choice."""
     refs = list(iter_field_refs(ast))
     if not refs:
         return None
@@ -136,13 +132,56 @@ def mutate_field(
         return None
 
 
+def mutate_field_weighted(
+    ast: ASTNode,
+    pool: Pool,
+    rng: random.Random,
+    field_usage: Mapping[str, int],
+) -> ASTNode | None:
+    """Field swap using inverse-frequency weighting.
+
+    Same as `mutate_field` but the candidate fields are sampled with
+    weight `clamp(1/(1+count)^0.5, 0.25, 4.0)` where `count` is the
+    number of individuals in the current population that already use
+    that field. See D-165.
+    """
+    refs = list(iter_field_refs(ast))
+    if not refs:
+        return None
+
+    path, node = rng.choice(refs)
+    assert node.field_def is not None
+    current = node.field_def
+    candidates = [
+        f for f in pool.fields.by_type(current.data_type)
+        if f.field_id != current.field_id
+    ]
+    if not candidates:
+        return None
+
+    if not field_usage:
+        new_field = rng.choice(candidates)
+    else:
+        weights: list[float] = []
+        for f in candidates:
+            count = field_usage.get(f.field_id, 0)
+            w = 1.0 / ((1.0 + count) ** _FIELD_WEIGHT_ALPHA)
+            if w < _FIELD_WEIGHT_MIN:
+                w = _FIELD_WEIGHT_MIN
+            elif w > _FIELD_WEIGHT_MAX:
+                w = _FIELD_WEIGHT_MAX
+            weights.append(w)
+        new_field = rng.choices(candidates, weights=weights, k=1)[0]
+
+    try:
+        return replace_subtree(ast, path, ASTNode.field_ref(new_field))
+    except ValueError:
+        return None
+
+
 def mutate_operator(
     ast: ASTNode, pool: Pool, rng: random.Random
 ) -> ASTNode | None:
-    """Swap the operator of a CALL node for a signature-compatible one.
-
-    Compatible means: same arity, same output DataType, same parameter
-    names (see D-048), and input types accept the existing children."""
     calls = list(iter_calls(ast))
     if not calls:
         return None
@@ -177,7 +216,6 @@ def mutate_operator(
 def mutate_subtree(
     ast: ASTNode, pool: Pool, rng: random.Random
 ) -> ASTNode | None:
-    """Replace a random subtree with a freshly built one of the same type."""
     nodes = list(iter_nodes(ast))
     if not nodes:
         return None
@@ -205,16 +243,24 @@ DEFAULT_STRATEGIES: tuple[Strategy, ...] = (
 )
 
 
-# --- dispatcher -------------------------------------------------------------
-
 class Mutator:
     """Runs mutation strategies in random order until one yields a
     distinct fingerprint.
 
     Not thread-safe: hold one Mutator per thread, or serialize calls.
+
+    When `field_usage` is supplied, the `mutate_field` strategy is
+    replaced by `mutate_field_weighted` at dispatch time. The list
+    `self.strategies` continues to report the caller's original
+    strategies; the swap is internal. See D-165.
     """
 
-    __slots__ = ("_pool", "_strategies", "_max_attempts")
+    __slots__ = (
+        "_pool",
+        "_strategies",
+        "_max_attempts",
+        "_field_usage",
+    )
 
     def __init__(
         self,
@@ -222,6 +268,7 @@ class Mutator:
         *,
         strategies: tuple[Strategy, ...] = DEFAULT_STRATEGIES,
         max_attempts: int = 20,
+        field_usage: Mapping[str, int] | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("at least one strategy is required")
@@ -230,20 +277,32 @@ class Mutator:
         self._pool = pool
         self._strategies = strategies
         self._max_attempts = max_attempts
+        self._field_usage = field_usage or {}
 
     @property
     def strategies(self) -> tuple[Strategy, ...]:
         return self._strategies
 
+    def _dispatch(
+        self, strategy: Strategy, ast: ASTNode, rng: random.Random
+    ) -> ASTNode | None:
+        """Call `strategy`, substituting the weighted variant for
+        `mutate_field` when field usage is available."""
+        if strategy is mutate_field and self._field_usage:
+            return mutate_field_weighted(
+                ast, self._pool, rng, self._field_usage,
+            )
+        return strategy(ast, self._pool, rng)
+
     def mutate(self, ast: ASTNode, rng: random.Random) -> ASTNode:
         original_fp = ast.fingerprint()
         for _ in range(self._max_attempts):
             strategy = rng.choice(self._strategies)
-            candidate = strategy(ast, self._pool, rng)
+            candidate = self._dispatch(strategy, ast, rng)
             if candidate is None:
                 continue
             if candidate.fingerprint() == original_fp:
-                continue  # D-047: must produce a distinct fingerprint
+                continue
             return candidate
         raise MutationError(
             f"no strategy produced a distinct fingerprint in "

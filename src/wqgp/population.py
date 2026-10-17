@@ -8,11 +8,9 @@ Design decisions:
 - AST generation is bottom-up with three hard limits. See D-042.
 - Generation failure raises; it does not return None. See D-043.
 - Only SCALAR leaves can be literals. See D-044.
-- Individual.with_status propagates terminal states (e.g. FAILED) so
-  that failed evaluations are not resubmitted. See D-125.
-
-This module does NOT evaluate individuals and does NOT talk to BRAIN.
-Fitness on an Individual is whatever the caller set; it may be None.
+- Individual.with_status propagates terminal states. See D-125.
+- RandomAstBuilder takes an optional field_usage map for weighted
+  field sampling. See D-165.
 """
 from __future__ import annotations
 
@@ -28,8 +26,6 @@ from wqgp.pool import Pool
 from wqgp.types import DataType, ParamDomain, ParamKind
 
 
-# --- errors -----------------------------------------------------------------
-
 class PopulationError(RuntimeError):
     """Base class for population-level failures."""
 
@@ -42,8 +38,6 @@ class GenerationError(PopulationError):
     """Raised when RandomAstBuilder cannot construct a valid AST."""
 
 
-# --- numeric helpers --------------------------------------------------------
-
 def _is_finite_number(v: object) -> bool:
     if isinstance(v, bool):
         return False
@@ -54,20 +48,8 @@ def _is_finite_number(v: object) -> bool:
     return True
 
 
-# --- Individual -------------------------------------------------------------
-
 class Individual:
-    """One candidate alpha expression plus its evaluation state.
-
-    Equality and hashing are by fingerprint only: two Individuals with the
-    same expression are the same Individual, regardless of fitness. This
-    makes `set(individuals)` and `dict[fingerprint, Individual]` do the
-    right thing during dedup.
-
-    Instances are effectively immutable: attribute reassignment raises.
-    Use `with_evaluation()` to obtain a new Individual carrying results,
-    and `with_status()` to propagate a terminal state.
-    """
+    """One candidate alpha expression plus its evaluation state."""
 
     __slots__ = (
         "ast",
@@ -130,7 +112,6 @@ class Individual:
         parents: tuple[str, ...] = (),
         status: EvaluationStatus = EvaluationStatus.PENDING,
     ) -> "Individual":
-        """Construct an Individual, computing the fingerprint from the AST."""
         return cls(
             ast=ast,
             fingerprint=ast.fingerprint(),
@@ -150,7 +131,6 @@ class Individual:
         fitness: float,
         metrics: tuple[tuple[str, float], ...] = (),
     ) -> "Individual":
-        """Return a new Individual carrying evaluation results."""
         return Individual(
             ast=self.ast,
             fingerprint=self.fingerprint,
@@ -162,15 +142,6 @@ class Individual:
         )
 
     def with_status(self, status: EvaluationStatus) -> "Individual":
-        """Return a new Individual with a different status.
-
-        Used to propagate terminal states (e.g. FAILED) so that the
-        Coordinator's _evaluate does not resubmit them. See D-125.
-
-        A SUCCESS status requires a non-None fitness; constructing an
-        Individual with SUCCESS and no fitness raises ValueError, which
-        is exactly the desired behavior here.
-        """
         return Individual(
             ast=self.ast,
             fingerprint=self.fingerprint,
@@ -181,16 +152,12 @@ class Individual:
             status=status,
         )
 
-    # --- immutability ---
-
     def __setattr__(self, name: str, value: object) -> None:
         if hasattr(self, name):
             raise AttributeError(
                 f"Individual is immutable; cannot reassign {name!r}"
             )
         object.__setattr__(self, name, value)
-
-    # --- identity: by fingerprint only (D-039) ---
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Individual):
@@ -208,16 +175,8 @@ class Individual:
         )
 
 
-# --- Population -------------------------------------------------------------
-
 class Population:
-    """A collection of Individuals with unique fingerprints.
-
-    - Duplicates by fingerprint are rejected at construction.
-    - Iteration order is deterministic (sorted by fingerprint).
-    - `__eq__` is order-independent: same fingerprint set == equal.
-    - Instances are logically immutable; internal indexes are MappingProxy.
-    """
+    """A collection of Individuals with unique fingerprints."""
 
     __slots__ = ("_individuals", "_by_fp")
 
@@ -239,23 +198,17 @@ class Population:
             by_fp[fp] for fp in sorted(by_fp)
         )
 
-    # --- construction helpers ---
-
     @classmethod
     def empty(cls) -> "Population":
         return cls(())
 
     @classmethod
     def concat(cls, *populations: "Population") -> "Population":
-        """Union of populations. Duplicates across inputs are deduplicated;
-        the first occurrence (in argument order) wins."""
         seen: dict[str, Individual] = {}
         for pop in populations:
             for ind in pop:
                 seen.setdefault(ind.fingerprint, ind)
         return cls(tuple(seen.values()))
-
-    # --- access ---
 
     def by_fingerprint(self, fp: str) -> Individual | None:
         return self._by_fp.get(fp)
@@ -276,8 +229,6 @@ class Population:
             i for i in self._individuals
             if i.fitness is not None and i.fitness >= threshold
         )
-
-    # --- dunders ---
 
     def __len__(self) -> int:
         return len(self._individuals)
@@ -304,12 +255,9 @@ class Population:
         return f"Population(n={len(self._individuals)})"
 
 
-# --- Random AST builder -----------------------------------------------------
-
 def _sample_param(
     domain: ParamDomain, rng: random.Random
 ) -> int | float | str:
-    """Draw a value from a ParamDomain."""
     if domain.kind is ParamKind.INT_RANGE:
         lo = int(domain.min_value)  # type: ignore[arg-type]
         hi = int(domain.max_value)  # type: ignore[arg-type]
@@ -326,11 +274,23 @@ def _sample_param(
 _LITERAL_POOL: tuple[int | float, ...] = (1, 5, 10, 0.5, 1.0, -1)
 
 
+# Field sampling weight bounds for D-165. Clamp keeps any field
+# selectable even if it is currently overrepresented (prevents "hard
+# ban"). The exponent 0.5 is a mild square-root penalty.
+_FIELD_WEIGHT_ALPHA = 0.5
+_FIELD_WEIGHT_MIN = 0.25
+_FIELD_WEIGHT_MAX = 4.0
+
+
 class RandomAstBuilder:
     """Builds random, type-valid ASTs from a Pool.
 
-    Stateful and single-use per build: `build()` resets internal counters
-    and stores the RNG on the instance. Do not call concurrently.
+    Stateful and single-use per build. Not thread-safe.
+
+    The optional `field_usage` map changes field sampling from uniform
+    to inverse-frequency weighted. The key is a field_id and the value
+    is the number of individuals in the *current population* that use
+    that field. See D-165.
     """
 
     __slots__ = (
@@ -340,6 +300,7 @@ class RandomAstBuilder:
         "_max_operator_attempts",
         "_nodes_left",
         "_rng",
+        "_field_usage",
     )
 
     def __init__(
@@ -349,6 +310,7 @@ class RandomAstBuilder:
         max_depth: int = 4,
         max_nodes: int = 25,
         max_operator_attempts: int = 15,
+        field_usage: Mapping[str, int] | None = None,
     ) -> None:
         if max_depth < 0:
             raise ValueError("max_depth must be >= 0")
@@ -362,9 +324,9 @@ class RandomAstBuilder:
         self._max_operator_attempts = max_operator_attempts
         self._nodes_left = 0
         self._rng: random.Random = random.Random()
+        self._field_usage: Mapping[str, int] = field_usage or {}
 
     def build(self, target_type: DataType, rng: random.Random) -> ASTNode:
-        """Return a random AST of `target_type`, or raise GenerationError."""
         self._rng = rng
         for _ in range(self._max_operator_attempts):
             self._nodes_left = self._max_nodes
@@ -375,6 +337,26 @@ class RandomAstBuilder:
             f"failed to build AST of type {target_type.value} "
             f"within {self._max_operator_attempts} attempts"
         )
+
+    def _pick_field(self, fields: tuple) -> object:
+        """Sample one field from `fields` with inverse-frequency weight.
+
+        When `_field_usage` is empty (initial generation, or the flag
+        is off), falls back to uniform choice. See D-165.
+        """
+        if not self._field_usage:
+            return self._rng.choice(fields)
+
+        weights: list[float] = []
+        for f in fields:
+            count = self._field_usage.get(f.field_id, 0)
+            w = 1.0 / ((1.0 + count) ** _FIELD_WEIGHT_ALPHA)
+            if w < _FIELD_WEIGHT_MIN:
+                w = _FIELD_WEIGHT_MIN
+            elif w > _FIELD_WEIGHT_MAX:
+                w = _FIELD_WEIGHT_MAX
+            weights.append(w)
+        return self._rng.choices(fields, weights=weights, k=1)[0]
 
     def _build(self, target_type: DataType, depth: int) -> ASTNode | None:
         if self._nodes_left < 1:
@@ -391,20 +373,22 @@ class RandomAstBuilder:
             scalar_fields = self._pool.fields.by_type(DataType.SCALAR)
             if scalar_fields and self._rng.random() < 0.5:
                 self._nodes_left -= 1
-                return ASTNode.field_ref(self._rng.choice(scalar_fields))
+                return ASTNode.field_ref(self._pick_field(scalar_fields))
             return self._make_literal()
 
         fields = self._pool.fields.by_type(target_type)
         if not fields:
             return None
         self._nodes_left -= 1
-        return ASTNode.field_ref(self._rng.choice(fields))
+        return ASTNode.field_ref(self._pick_field(fields))
 
     def _make_literal(self) -> ASTNode:
         self._nodes_left -= 1
         return ASTNode.literal(self._rng.choice(_LITERAL_POOL))
 
-    def _build_call(self, target_type: DataType, depth: int) -> ASTNode | None:
+    def _build_call(
+        self, target_type: DataType, depth: int
+    ) -> ASTNode | None:
         candidates = self._pool.operators.by_output_type(target_type)
         if not candidates:
             return None
@@ -418,7 +402,9 @@ class RandomAstBuilder:
                 return node
         return None
 
-    def _try_operator(self, op: OperatorDef, depth: int) -> ASTNode | None:
+    def _try_operator(
+        self, op: OperatorDef, depth: int
+    ) -> ASTNode | None:
         if self._nodes_left < 1:
             return None
         self._nodes_left -= 1

@@ -4516,3 +4516,358 @@ a multiplicative penalty; the failure mode of multiplication is
 documented in D-157 and was observed in the D-162 A/B.
 
 ---
+
+---
+
+## D-164 — AST simplification with strict semantic equivalence
+
+**Decision**: add `simplify_ast(ast)` in a new module
+`src/wqgp/ast_ops.py`. It applies only these rules, recursively,
+until no rule fires:
+
+- `max(x, x) → x`
+- `min(x, x) → x`
+- `add(x, 0) → x`
+- `add(0, x) → x`
+- `subtract(x, 0) → x`
+- `multiply(x, 1) → x`
+- `multiply(1, x) → x`
+- `divide(x, 1) → x`
+
+`count_distinct_fields(ast)` counts fields in the tree given, and
+callers who need the count for a raw expression call
+`simplify_ast` first. `collect_fields(ast)` returns the set.
+
+**Why**: the v3 A/B (D-163 follow-up) revealed that the search found
+expressions like
+`signed_power(fnd6_mrc5, max(max(fnd6_mrc5, fnd6_mrc5), fnd6_mrc5))`,
+where the `max(max(x, x), x)` wrapper is semantically `x`. The
+expression uses the same field four times and "looks" complex, but
+carries information from exactly one field. Any downstream consumer
+(diversity mechanism, field-count statistic, human reading the
+output) would misjudge this expression as multi-field.
+
+Two purposes:
+
+1. **Make field counting honest.** The elite-diversity mechanism
+   (D-166) decides whether to reserve a slot for a multi-field
+   individual based on `count_distinct_fields`. That function must
+   see through the redundant wrapper.
+2. **Save simulation budget.** An expression whose structure is
+   reducible to a much smaller one rarely produces a different
+   fitness value. Catching the reduction locally avoids paying
+   BRAIN's quota for structure that adds no information.
+
+The rules are deliberately limited to cases where the identity holds
+under IEEE 754 semantics including NaN and infinity. Rules that could
+change behavior are NOT applied:
+
+- `power(x, 1) → x` — excluded. BRAIN's `power` may not follow IEEE
+  754 for negative bases.
+- `power(x, 0) → 1` — excluded. `NaN ** 0` is not 1 in general.
+- `multiply(x, 0) → 0` — excluded. `Inf * 0` is NaN in IEEE 754.
+- `reverse(reverse(x)) → x` — excluded. BRAIN's `reverse` semantics
+  are not guaranteed to be an involution.
+- `add(x, x) → multiply(x, 2)` — excluded. Introduces a new operator
+  rather than reducing.
+
+Semantic equality for the `max(x, x)` and `min(x, x)` rules uses
+`ASTNode.fingerprint()`, not structural equality. That way
+`max(add(a, b), add(b, a))` is recognized as `max(x, x)` under
+commutative normalization, even though the two inner nodes have
+different child order.
+
+Simplification is bottom-up: children are simplified first, then the
+current node, then the result is re-simplified to catch any cascade.
+`max(max(x, x), x)` therefore reduces to `x` in a single call.
+
+Each rebuild of a `CALL` node goes through `ASTNode.call`, which
+re-runs `_validate_call`. A simplification that would produce a
+type-invalid tree therefore raises a `ValueError` instead of silently
+producing a corrupted AST. This is defensive: all current rules are
+provably type-preserving, but the validation catches any future rule
+that is not.
+
+**Revisit if**: the simulation pipeline reports a case where a
+simplified expression performs measurably differently from the
+original. That would indicate one of the rules is not IEEE-safe on
+BRAIN's actual implementation. Drop the offending rule; do not
+"simplify around" it.
+
+---
+
+---
+
+## D-165 — Field-weighted sampling and field-replacement mutation
+
+**Decision**: two places weight field choice by current-population
+usage:
+
+1. `RandomAstBuilder.__init__` accepts `field_usage: Mapping[str, int]`
+   and, when it is non-empty, samples fields with weight
+   `clamp(1/(1+count)^0.5, 0.25, 4.0)`. When the map is empty (initial
+   generation, or diversity disabled), it falls back to uniform
+   choice.
+2. `Mutator` accepts `field_usage` and, when it is non-empty,
+   dispatches `mutate_field` to a `mutate_field_weighted` variant
+   that uses the same weights for its candidate fields.
+
+The map is `{field_id: number_of_individuals_in_population_using_it}`.
+`count` is a count of individuals, not of occurrences; an individual
+that uses the same field three times counts as 1.
+
+**Why**: the A/B data from D-163 follow-up showed both fitness
+strategies converge to a single field (`fnd6_mrc5` in the sharpe
+group, `forward_price_1080` in the feasibility group). Once the
+population is dominated by one field, mutation rarely introduces a
+new field because the pool has 4363 fields and uniform sampling
+almost never picks a different one. The field-weighted variants are a
+soft nudge: overrepresented fields get a lower probability but are
+never banned (the 0.25 floor keeps them reachable).
+
+The clamp matters. Without the 0.25 floor, a field used by every
+individual would have weight `1/(1+N)^0.5` which for a population of
+20 is ~0.22 — close enough to zero that it becomes a de facto ban.
+The floor keeps the field selectable while making it unlikely. The
+4.0 cap prevents a never-seen field from being sampled so heavily
+that it starves everything else.
+
+**Revisit if**: A/B shows that the weighting does not reduce
+concentration. Then try `_FIELD_WEIGHT_ALPHA = 0.8` (steeper) or
+`_FIELD_WEIGHT_MIN = 0.1` (more aggressive floor). Do NOT remove the
+cap; without it, unexplored fields would dominate the sample and the
+search would lose its exploitation phase.
+
+---
+
+## D-166 — Elite selection reserves one slot for a multi-field individual
+
+**Decision**: `select_elites(pop, n, reserve_multi_field=True)` reserves
+one elite slot for the best individual whose *simplified* AST contains
+at least 2 distinct fields. Slot 1 is always the raw-fitness best
+(unchanged from D-061's protection). Slot 2, when `reserve_multi_field`
+is True and a qualifying individual exists, is the multi-field one.
+Remaining slots are filled by raw fitness. If no multi-field
+individual exists, the reserved slot falls back to raw fitness.
+
+`diversity_enabled` in `SelectionConfig` toggles this; when False,
+elite selection is exactly as it was before D-166.
+
+**Why**: the A/B in D-162 showed that with elite protection of only
+the raw best, single-field lineages completely dominate. Since a
+single-field alpha can pass 7/8 checks and fail only `LOW_SUB_UNIVERSE_
+SHARPE` (three concrete examples from `fnd6_mrc5`), the population
+converges to a local optimum that produces zero submittable alphas
+even though every individual in the population is "high fitness" by
+the old metric.
+
+Reserving one slot for a multi-field individual forces the
+population to keep at least one lineage that has a structurally
+different signal source. Even if that individual's fitness is lower,
+it has a much higher chance of passing the sub-universe check (from
+the D-162 follow-up: 97.8% pass rate for multi-field vs 89.2% for
+single-field in the CLEAN subset).
+
+The multi-field determination uses `simplify_ast` first (D-164). An
+expression like `signed_power(fnd6_mrc5, max(max(fnd6_mrc5,
+fnd6_mrc5), fnd6_mrc5))` uses 4 field references but is
+single-field after simplification. Without simplification, the
+mechanism would reserve a slot for what looks like a diverse
+expression but is in fact a redundant single-field one.
+
+**Revisit if**: A/B shows that the reserved slot is actively harmful
+— e.g., best fitness drops by more than 20% relative to the old
+behavior. Then try `elite_count=3` (so two slots remain for raw
+fitness) before removing the reservation. Do NOT remove the
+mechanism until the concentration metric shows it is not needed.
+
+---
+
+## D-167 — Coordinator computes field usage per generation
+
+**Decision**: `Coordinator` computes `compute_field_usage(pop)` at the
+top of each generation's breeding step, logs the top-3 fields, and
+rebuilds `self._mutator` with the resulting map. When
+`diversity_enabled` is False, this step is skipped entirely: the
+mutator keeps its empty map and does uniform sampling.
+
+`compute_field_usage` lives at module scope in `coordinator.py` (not
+as a method) so it can be unit-tested directly.
+
+**Why**: the map has to be computed from the current generation's
+population, not from historical runs. A field that was heavily used
+in a previous run but is absent from the current population should
+get weight 1.0 (its natural probability), not a depressed weight
+carried over. Computing fresh each generation also means the map
+tracks drift within a run: a field that starts rare but becomes
+popular will see its weight drop as generations progress, which is
+the desired feedback.
+
+Rebuilding the Mutator each generation rather than mutating its
+state is a small simplification. `Mutator` holds only references to
+the pool and the (immutable) strategy tuple; rebuilding it costs a
+handful of attribute assignments. In exchange, the mutator's
+`field_usage` attribute is set at construction time and does not
+require a setter or a mutable-by-convention argument.
+
+The top-3 logging is deliberate: it answers "did the mechanism
+actually see usage going down?" without needing to query the run DB
+afterward.
+
+**Revisit if**: profiling shows the per-generation rebuild is
+noticeable (it will not be at these population sizes). Then add a
+`Mutator.set_field_usage` method and reuse the instance. Do NOT pass
+the map through the `next_generation` call chain; the mutator already
+receives it, and threading it through `_breed_one` would duplicate
+the argument.
+
+---
+
+---
+
+## D-168 — Seeds are Python builders, not parsed strings
+
+**Decision**: each seed is a Python function
+`(pool: Pool) -> ASTNode` living in `src/wqgp/seeds.py`. Seeds are
+NOT stored as expression strings, NOT parsed at startup, NOT
+loaded from a JSON file.
+
+**Why**: three reasons.
+
+1. **Type safety at construction time.** `ASTNode.call` validates
+   arity, input types, output types, and parameter domains on every
+   call. A seed that references a missing field, uses a removed
+   operator, or passes an out-of-range parameter raises immediately
+   with a clear message. A string-based seed would only fail at
+   parse time, and a JSON-based seed would only fail at
+   deserialization time — both far from the code that constructed
+   the seed.
+
+2. **Zero new code.** `scripts/try_seeds.py` already contained five
+   builder functions that constructed all five seeds successfully.
+   Promoting them to a library module costs nothing beyond the
+   registry wrapper.
+
+3. **Cost of the alternative is real.** The reference candidate
+   strings contain infix notation (`+(-1*x)`), implicit negation
+   (`-1*(...)`), and format variations that a naive parser would
+   mishandle. A parser that handles BRAIN's full expression grammar
+   is ~500 lines plus regression tests; one that handles only the
+   S-function subset is ~250 lines and cannot import future
+   reference alphas without extension. Both are premature for five
+   hand-curated seeds.
+
+The registry (`SEEDS`) is a tuple of `SeedSpec` dataclasses, each
+carrying `seed_id`, `builder`, `source_alpha_id`, `historical_sharpe`,
+and `note`. The metadata exists so a future analysis can correlate
+"which seed lineage produced the best offspring" without having to
+reverse-engineer that from the AST.
+
+If a batch-import path is needed later (e.g. "auto-convert 87
+multi-field reference alphas to seeds"), write a separate offline
+tool that emits a seeds.py-compatible module. Do NOT put the parser
+inside the GP run path; a parse failure at startup would block the
+run, which is a worse failure mode than "the conversion tool failed
+and I fixed a line by hand".
+
+**Revisit if**: seed count exceeds ~50. At that point the Python
+module becomes unwieldy and a generator tool is justified. The
+generator should still emit Python builder functions, not strings,
+so that construction-time validation is preserved.
+
+---
+
+## D-169 — Seed loading is per-seed fault-tolerant, global fault-fatal
+
+**Decision**: `load_seeds(pool)` iterates every `SeedSpec` in the
+registry:
+
+- If a builder raises (missing field, changed signature, bad
+  parameter), the error is caught, logged at WARNING with the seed
+  ID, and that seed is skipped.
+- If every builder fails, `load_seeds` raises `RuntimeError`. The
+  message names each failed seed and its error.
+- If at least one builder succeeds, `load_seeds` returns the
+  successful list.
+
+The caller (`Coordinator._initial_setup`) then samples
+`min(config.seed_count, len(built))` seeds and injects them into
+gen 0.
+
+**Why**: two failure modes deserve different responses.
+
+**Per-seed failures are common and harmless.** BRAIN occasionally
+retires a data field, or we change an operator signature in
+`signatures.json`. In either case, one or two seeds out of five stop
+building while the rest are unaffected. Aborting the whole run
+because `anl4_afv4_dts_spe` got renamed would be hostile: the
+remaining four seeds are still useful, and the GP can run.
+
+**Global failures are systemic and must be visible.** If all five
+seeds fail, the pool itself is broken: either the `signatures.json`
+no longer describes the operators the seeds use, or the field pool
+no longer contains the fields the seeds reference. Silently falling
+back to uniform random initialization — the AI-recommended
+alternative — would hide this. The user would see "seed injection
+enabled: 5 seeds" in the log, then notice that no seed-shaped
+individuals appear in gen 0, and wonder why.
+
+The `--no-seed-injection` flag is orthogonal to both rules. When the
+user explicitly disables seed injection, `load_seeds` is never
+called and no failure can occur. Explicit intent overrides the
+fault-tolerant path.
+
+The log lines emitted by `load_seeds` are:
+
+    [seeds] builder <id> failed: <ExcType>: <message>   (per failure)
+    [seeds] N / M seeds built; K skipped                (if any skipped)
+
+When every seed fails, the RuntimeError message embeds the same
+per-failure details, so a CI run that fails on seed construction
+gets a single actionable error rather than a log full of warnings
+followed by a generic "no seeds" message.
+
+**Revisit if**: we add a "strict seeds" mode for CI (raise on any
+single failure). Then add a `strict: bool = False` parameter to
+`load_seeds` and check it before the per-seed `continue`. Do NOT
+reverse the default; a research pipeline should not abort because
+one reference alpha aged out.
+
+---
+
+## D-170 — Coordinator tests must set seed_count=0
+
+**Decision**: every test that constructs a `RunConfig` against a
+synthetic test pool (not the real `pool.json`) must set
+`seed_count=0`.
+
+**Why**: the seeds in `src/wqgp/seeds.py` reference fields
+(`debt`, `assets`, `returns`, `anl4_afv4_dts_spe`) that do not
+exist in the synthetic test pool. When `seed_count > 0` (the
+default is 3), `Coordinator._initial_setup` calls `load_seeds`,
+every seed builder fails, and `load_seeds` raises `RuntimeError`
+per D-169. That failure is *correct behavior* — it is the whole
+point of D-169 — but it makes every integration test fail with
+`CoordinatorError` before it can exercise what it was written to
+test.
+
+The fix is on the test side, not the production side. Setting
+`seed_count=0` in test `RunConfig` construction disables seed
+injection for tests that do not care about it. A dedicated test
+for seed injection (in `tests/test_seeds.py`) exercises the
+mechanism with the real pool.
+
+**Revisit if**: a test class needs to exercise seed injection
+against a synthetic pool. Then add a small synthetic seed registry
+to that test, and set `seed_count` to a positive number. Do NOT
+weaken D-169 (dropping the "all seeds failed -> raise" rule) to
+make tests pass. D-169's failure mode is the reason we notice a
+broken pool in production.
+
+**Scope expansion (Round 2)**: the same rule applies to CLI tests.
+`tests/test_cli.py` calls `cli.main(["run", ...])` with a synthetic
+test pool that lacks the seed fields. Each such call must include
+`"--seed-count", "0"` to bypass seed injection. Without it, the CLI
+path reaches `Coordinator._initial_setup`, `load_seeds` fails on
+every builder, and the test gets `EXIT_ERROR` instead of the behavior
+it was written to check.

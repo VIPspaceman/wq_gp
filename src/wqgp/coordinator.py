@@ -4,20 +4,27 @@ Design decisions:
 - AST/Individual/Population serialization lives in gp_serialization.py.
   See D-065.
 - Expression rendering lives in ast.py. See D-066.
-- Checkpoints save the UNEVALUATED next-generation population. See D-067.
+- Checkpoints save the UNEVALUATED next-generation population. See
+  D-067.
 - Before submitting, existing evaluations are absorbed from the store.
   See D-068.
 - One Executor for the whole run. See D-069.
 - The loop ends on budget exhaustion, no-progress, or max_generations.
   See D-070.
-- Notifications are optional; the default is NullNotifier. See D-098.
-- Per-generation progress logs at INFO to "wqgp.gp". See D-115 / D-134.
+- Notifications are optional; default is NullNotifier. See D-098.
+- Per-generation progress logs at INFO. See D-115 / D-134.
 - FAILED evaluations propagate to the Individual's status. See D-125.
 - If a cache is provided, _evaluate consults it before submitting and
-  _merge_evaluations writes every reusable result back to it. The
-  run DB is still written in both cases. See D-146.
-- RunConfig now carries an EvaluationConfig, the single source of
-  truth for a simulation's identity. See D-138.
+  _merge_evaluations writes every reusable result back to it. See
+  D-146.
+- RunConfig carries an EvaluationConfig. See D-138.
+- Run DB and checkpoints live under <root>/runs/. See D-161.
+- Resume validates budget against the checkpoint. See D-162.
+- Seeds from seeds.py are injected into gen 0 before random fill.
+  See D-168 / D-169 / D-170.
+- Each generation, field usage across the population is computed and
+  passed to a fresh Mutator, activating the weighted field-swap
+  strategy. See D-165 / D-167.
 """
 from __future__ import annotations
 
@@ -25,11 +32,13 @@ import json
 import logging
 import random
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 from wqgp._ids import validate_run_id
 from wqgp.ast import render as render_ast
+from wqgp.ast_ops import collect_fields, simplify_ast
 from wqgp.budget import Budget, BudgetTracker
 from wqgp.cache import (
     CacheEntry,
@@ -61,11 +70,24 @@ from wqgp.population import (
     Population,
     RandomAstBuilder,
 )
+from wqgp.seeds import load_seeds
 from wqgp.selection import SelectionConfig, next_generation
 from wqgp.types import DataType
 
 
 log = logging.getLogger("wqgp.gp")
+
+
+def compute_field_usage(pop: Population) -> dict[str, int]:
+    """Count distinct-field occurrences in `pop` after simplification.
+    See D-165 / D-167.
+    """
+    usage: Counter[str] = Counter()
+    for ind in pop:
+        simplified = simplify_ast(ind.ast)
+        for f in collect_fields(simplified):
+            usage[f] += 1
+    return dict(usage)
 
 
 class CoordinatorError(RuntimeError):
@@ -91,6 +113,7 @@ class RunConfig:
     builder_max_nodes: int = 25
     crossover_max_depth: int = 6
     crossover_max_nodes: int = 40
+    seed_count: int = 3
 
     def __post_init__(self) -> None:
         validate_run_id(self.run_id)
@@ -113,12 +136,14 @@ class RunConfig:
             raise ValueError("crossover_max_depth must be >= 1")
         if self.crossover_max_nodes < 1:
             raise ValueError("crossover_max_nodes must be >= 1")
-        if self.crossover_max_nodes < 1:
-            raise ValueError("crossover_max_nodes must be >= 1")
         if self.fitness_strategy not in ("feasibility", "sharpe"):
             raise ValueError(
                 f"fitness_strategy must be 'feasibility' or 'sharpe', "
                 f"got {self.fitness_strategy!r}"
+            )
+        if self.seed_count < 0:
+            raise ValueError(
+                f"seed_count must be >= 0, got {self.seed_count}"
             )
 
 
@@ -188,10 +213,14 @@ class Coordinator:
 
         log.info(
             "[%s] run starting: generation=%d population=%d "
-            "max_generations=%d cache=%s",
+            "max_generations=%d cache=%s fitness_strategy=%s "
+            "diversity=%s seed_count=%d",
             self._config.run_id, start_gen, len(pop),
             self._config.max_generations,
             "on" if self._cache is not None else "off",
+            self._config.fitness_strategy,
+            "on" if self._config.selection.diversity_enabled else "off",
+            self._config.seed_count,
         )
 
         executor = Executor(
@@ -275,6 +304,27 @@ class Coordinator:
                 if generation + 1 >= self._config.max_generations:
                     break
 
+                if self._config.selection.diversity_enabled:
+                    field_usage = compute_field_usage(pop)
+                    if field_usage:
+                        top3 = ", ".join(
+                            f"{f}={n}"
+                            for f, n in sorted(
+                                field_usage.items(),
+                                key=lambda kv: (-kv[1], kv[0]),
+                            )[:3]
+                        )
+                        log.info(
+                            "[%s] gen %d: %d distinct fields "
+                            "(top: %s)",
+                            self._config.run_id, generation,
+                            len(field_usage), top3,
+                        )
+                        self._mutator = Mutator(
+                            self._config.pool,
+                            field_usage=field_usage,
+                        )
+
                 pop = next_generation(
                     pop,
                     self._mutator,
@@ -339,14 +389,68 @@ class Coordinator:
             if self._config.initial_population_size is not None
             else self._config.selection.population_size
         )
+
+        individuals: list[Individual] = []
+        seen_fps: set[str] = set()
+
+        # --- 1. Seed injection (D-168 / D-169 / D-170) ---
+        seeds_injected = 0
+        if self._config.seed_count > 0:
+            try:
+                built = load_seeds(self._config.pool)
+            except RuntimeError as e:
+                # Every seed failed to build. Per D-169 this is fatal:
+                # the pool is incompatible with the seed set, and we
+                # refuse to silently fall back to random init.
+                raise CoordinatorError(
+                    f"seed injection failed for run "
+                    f"{self._config.run_id!r}: {e}"
+                ) from e
+
+            to_inject = built[: self._config.seed_count]
+            log.info(
+                "[%s] seed injection: %d / %d seeds selected "
+                "(seed_count=%d, available=%d)",
+                self._config.run_id, len(to_inject), len(built),
+                self._config.seed_count, len(built),
+            )
+            for spec, ast in to_inject:
+                fp = ast.fingerprint()
+                if fp in seen_fps:
+                    log.warning(
+                        "[%s] seed %s produced duplicate fingerprint, "
+                        "skipped",
+                        self._config.run_id, spec.seed_id,
+                    )
+                    continue
+                seen_fps.add(fp)
+                individuals.append(Individual.from_ast(ast, generation=0))
+                log.info(
+                    "[%s] seed injected: %s (hist_sharpe=%.2f, note=%s)",
+                    self._config.run_id, spec.seed_id,
+                    spec.historical_sharpe, spec.note or "-",
+                )
+                seeds_injected += 1
+
+            if seeds_injected > 0:
+                # If seeds alone fill or exceed the population, truncate.
+                if len(individuals) >= size:
+                    individuals = individuals[:size]
+                    log.warning(
+                        "[%s] seed_count=%d > population_size=%d; "
+                        "truncating seeds to fit",
+                        self._config.run_id, seeds_injected, size,
+                    )
+                    seen_fps = {i.fingerprint for i in individuals}
+                    seeds_injected = len(individuals)
+
+        # --- 2. Random fill to target size ---
         builder = RandomAstBuilder(
             self._config.pool,
             max_depth=self._config.builder_max_depth,
             max_nodes=self._config.builder_max_nodes,
         )
 
-        individuals: list[Individual] = []
-        seen_fps: set[str] = set()
         attempts = 0
         generation_failures = 0
         max_attempts = size * 20
@@ -372,15 +476,18 @@ class Coordinator:
         if len(individuals) < size:
             log.warning(
                 "[%s] initial population short: target=%d actual=%d "
-                "attempts=%d generation_failures=%d duplicates=%d",
+                "seeds=%d random=%d attempts=%d generation_failures=%d",
                 self._config.run_id, size, len(individuals),
+                seeds_injected, len(individuals) - seeds_injected,
                 attempts, generation_failures,
-                attempts - generation_failures - len(individuals),
             )
         else:
             log.info(
-                "[%s] initial population: %d individuals in %d attempts",
-                self._config.run_id, len(individuals), attempts,
+                "[%s] initial population: %d individuals "
+                "(seeds=%d, random=%d, attempts=%d)",
+                self._config.run_id, len(individuals),
+                seeds_injected, len(individuals) - seeds_injected,
+                attempts,
             )
 
         pop = Population(individuals)
@@ -396,10 +503,6 @@ class Coordinator:
         used = snap.total_simulations_used
         limit = self._config.budget.total_simulations
 
-        # BudgetTracker raises a bare ValueError when `used > limit`,
-        # which surfaces as "unexpected error" in the CLI. Catch it
-        # here and raise a CoordinatorError with a message the user
-        # can act on. See D-162.
         if used > limit:
             raise CoordinatorError(
                 f"cannot resume run {self._config.run_id!r} from "
@@ -556,8 +659,7 @@ class Coordinator:
 
         cfg = self._config.evaluation_config
         cache_key = cfg.cache_key(
-            rec.fingerprint,
-            self._config.fitness_strategy,
+            rec.fingerprint, self._config.fitness_strategy,
         )
         created_at = rec.created_at if rec.created_at > 0 else time.time()
 

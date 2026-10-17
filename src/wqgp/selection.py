@@ -1,17 +1,18 @@
 """Selection operators for the GP loop.
 
 Design decisions:
-- Selection defaults to single-objective (fitness only). See D-059.
-- Tournament sampling is without replacement. See D-060.
-- Crossover requires two parents with distinct fingerprints. See D-063.
+- Tournament uses raw fitness, sampled without replacement. See
+  D-059, D-060.
+- Elites carry over unchanged. See D-061.
+- Crossover requires two parents with distinct fingerprints. See
+  D-063.
 - next_generation is best-effort on size. See D-062.
 - mode="pareto" dispatches to Pareto selection. See D-126.
-- mode="single" (default) uses fitness sharing when
-  diversity_enabled=True. See D-149.
-- Similarity is a weighted blend of field-Jaccard and operator-Jaccard.
-  See D-150.
-- Fitness sharing uses continuous similarity kernel + rank utility +
-  elite protection. See D-151.
+- mode="single" with diversity_enabled=True reserves one elite slot
+  for a multi-field individual (A'). See D-166.
+- The old fitness-sharing mechanism (D-149 / D-151) is removed: it
+  was measured to make concentration worse, not better. See D-164
+  reference and D-166.
 """
 from __future__ import annotations
 
@@ -19,135 +20,15 @@ import random
 from dataclasses import dataclass
 from typing import Callable
 
-from wqgp.ast import iter_field_refs, iter_nodes
+from wqgp.ast_ops import count_distinct_fields, simplify_ast
 from wqgp.crossover import Crossover, CrossoverError
 from wqgp.mutation import MutationError, Mutator
 from wqgp.population import Individual, Population
 
 
-# --- errors -----------------------------------------------------------------
-
 class SelectionError(RuntimeError):
     """Raised when selection cannot produce a new population."""
 
-
-# --- fitness sharing constants ----------------------------------------------
-
-# Weight of the field-set Jaccard in the similarity blend. See D-150.
-_FIELD_WEIGHT = 0.7
-
-# Weight of the operator-set Jaccard in the similarity blend.
-_OPERATOR_WEIGHT = 0.3
-
-# Similarity values at or below this contribute nothing to crowding.
-_SIMILARITY_FLOOR = 0.4
-
-# elite protection reserves one slot for the raw best individual.
-# See D-151.
-
-
-def _extract_field_set(ind: Individual) -> frozenset[str]:
-    """Field ids appearing anywhere in the individual's AST."""
-    return frozenset(
-        node.field_def.field_id
-        for _, node in iter_field_refs(ind.ast)
-        if node.field_def is not None
-    )
-
-
-def _extract_operator_set(ind: Individual) -> frozenset[str]:
-    """Operator names appearing anywhere in the individual's AST."""
-    return frozenset(
-        node.op_def.name
-        for _, node in iter_nodes(ind.ast)
-        if node.op_def is not None
-    )
-
-
-def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
-    """Jaccard similarity. Empty unions map to 1.0 (two empties are
-    identical)."""
-    if not a and not b:
-        return 1.0
-    union = a | b
-    if not union:
-        return 1.0
-    return len(a & b) / len(union)
-
-
-def _similarity(
-    fields_a: frozenset[str],
-    ops_a: frozenset[str],
-    fields_b: frozenset[str],
-    ops_b: frozenset[str],
-) -> float:
-    """Weighted blend of field-Jaccard and operator-Jaccard."""
-    field_j = _jaccard(fields_a, fields_b)
-    op_j = _jaccard(ops_a, ops_b)
-    return _FIELD_WEIGHT * field_j + _OPERATOR_WEIGHT * op_j
-
-
-def _share_contribution(sim: float) -> float:
-    """Continuous kernel: 0 below floor, linear to 1 at sim=1.
-
-    Chosen over a hard threshold to avoid the cliff effect where a
-    similarity of 0.49 contributes nothing and 0.51 contributes 0.5.
-    See D-151.
-    """
-    if sim <= _SIMILARITY_FLOOR:
-        return 0.0
-    return (sim - _SIMILARITY_FLOOR) / (1.0 - _SIMILARITY_FLOOR)
-
-
-def compute_adjusted_fitness(
-    pop: Population,
-) -> dict[str, float]:
-    """Return {fingerprint: adjusted_fitness} for every individual.
-
-    Algorithm (D-151):
-      1. Cache field and operator sets per individual.
-      2. O(n^2) similarity matrix.
-      3. crowding(i) = 1 + sum(share(sim(i, j)) for j != i)
-      4. utility(i) = ((N - r_i + 1) / N) ** 2, where r_i is the rank
-         by raw fitness descending (rank 1 = best).
-      5. adjusted(i) = utility(i) / crowding(i)
-    """
-    members = list(pop)
-    n = len(members)
-    if n == 0:
-        return {}
-
-    fields = [_extract_field_set(m) for m in members]
-    ops = [_extract_operator_set(m) for m in members]
-
-    crowd = [1.0] * n
-    for i in range(n):
-        acc = 0.0
-        fi, oi = fields[i], ops[i]
-        for j in range(n):
-            if i == j:
-                continue
-            sim = _similarity(fi, oi, fields[j], ops[j])
-            acc += _share_contribution(sim)
-        crowd[i] = 1.0 + acc
-
-    # Rank by raw fitness descending, ties broken by fingerprint for
-    # determinism.
-    def raw_key(idx: int) -> tuple[float, str]:
-        f = members[idx].fitness
-        fv = f if f is not None else float("-inf")
-        return (-fv, members[idx].fingerprint)
-
-    order = sorted(range(n), key=raw_key)
-
-    adjusted: dict[str, float] = {}
-    for rank, idx in enumerate(order, start=1):
-        utility = ((n - rank + 1) / n) ** 2
-        adjusted[members[idx].fingerprint] = utility / crowd[idx]
-    return adjusted
-
-
-# --- config -----------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
 class SelectionConfig:
@@ -197,29 +78,24 @@ class SelectionConfig:
                 )
 
 
-# --- helpers ----------------------------------------------------------------
-
 def _fitness_value(ind: Individual) -> float:
     return ind.fitness if ind.fitness is not None else float("-inf")
 
 
 def _pick_best(candidates: list[Individual]) -> Individual:
-    """Return the highest-fitness candidate; ties by fingerprint."""
     return max(
         candidates,
         key=lambda i: (_fitness_value(i), i.fingerprint),
     )
 
 
-# --- public operators (single-objective) ------------------------------------
-
 def tournament_select(
     population: Population,
     k: int,
     rng: random.Random,
 ) -> Individual:
-    """Sample min(k, len) individuals WITHOUT replacement and return
-    the one with the highest fitness. Ties broken by fingerprint.
+    """Sample min(k, len) individuals without replacement; return the
+    highest raw-fitness one.
     """
     if len(population) == 0:
         raise SelectionError("cannot select from an empty population")
@@ -234,29 +110,18 @@ def tournament_select(
 def select_elites(
     population: Population,
     n: int,
+    *,
+    reserve_multi_field: bool = False,
 ) -> tuple[Individual, ...]:
-    """Top-n evaluated individuals by raw fitness. Ties by fingerprint.
-    Returns fewer than n if fewer are evaluated.
-    """
-    if n < 0:
-        raise ValueError("n must be >= 0")
-    if n == 0:
-        return ()
-    evaluated = [i for i in population if i.fitness is not None]
-    evaluated.sort(key=lambda i: (-i.fitness, i.fingerprint))  # type: ignore[operator]
-    return tuple(evaluated[:n])
+    """Top-n by raw fitness, ties broken by fingerprint.
 
+    When `reserve_multi_field` is True and n >= 2 and at least one
+    multi-field individual is available, one slot is reserved for the
+    best such individual. The other slots follow raw fitness.
 
-def _select_elites_with_diversity(
-    population: Population,
-    n: int,
-    adjusted: dict[str, float],
-) -> tuple[Individual, ...]:
-    """Elite selection with diversity.
-
-    - One slot is reserved for the raw-fitness best evaluated
-      individual (the protection rule; see D-151).
-    - Remaining slots are filled by adjusted fitness descending.
+    "Multi-field" means `count_distinct_fields(simplify_ast(ast)) >= 2`,
+    so a single-field expression that repeats the field in a
+    semantically redundant wrapper does not qualify. See D-164 / D-166.
     """
     if n < 0:
         raise ValueError("n must be >= 0")
@@ -264,51 +129,33 @@ def _select_elites_with_diversity(
         return ()
 
     evaluated = [i for i in population if i.fitness is not None]
-    if not evaluated:
-        return ()
-
-    # Slot 1: the raw best.
-    raw_best = max(
-        evaluated,
-        key=lambda i: (i.fitness, i.fingerprint),  # type: ignore[arg-type,return-value]
-    )
-    if n == 1:
-        return (raw_best,)
-
-    remaining = [i for i in evaluated if i is not raw_best]
-    remaining.sort(
-        key=lambda i: (
-            -adjusted.get(i.fingerprint, 0.0),
-            i.fingerprint,
-        )
-    )
-    return (raw_best, *remaining[: n - 1])
-
-
-def _tournament_select_with_diversity(
-    population: Population,
-    k: int,
-    rng: random.Random,
-    adjusted: dict[str, float],
-) -> Individual:
-    """Tournament selection using adjusted fitness instead of raw."""
-    if len(population) == 0:
-        raise SelectionError("cannot select from an empty population")
-    if k < 1:
-        raise ValueError("tournament size must be >= 1")
-    members = list(population)
-    sample_size = min(k, len(members))
-    contestants = rng.sample(members, sample_size)
-    return max(
-        contestants,
-        key=lambda i: (
-            adjusted.get(i.fingerprint, 0.0),
-            i.fingerprint,
-        ),
+    evaluated.sort(
+        key=lambda i: (-i.fitness, i.fingerprint)  # type: ignore[operator]
     )
 
+    if (
+        not reserve_multi_field
+        or n == 1
+        or len(evaluated) < 2
+    ):
+        return tuple(evaluated[:n])
 
-# --- breeding ---------------------------------------------------------------
+    raw_best = evaluated[0]
+    remaining = evaluated[1:]
+    multi_candidates = [
+        i for i in remaining
+        if count_distinct_fields(simplify_ast(i.ast)) >= 2
+    ]
+    result: list[Individual] = [raw_best]
+    if multi_candidates:
+        # remaining is already sorted by fitness; take the first
+        # multi-field individual.
+        multi_pick = multi_candidates[0]
+        result.append(multi_pick)
+        remaining = [i for i in remaining if i is not multi_pick]
+    result.extend(remaining[: n - len(result)])
+    return tuple(result)
+
 
 TournamentFn = Callable[[], Individual]
 
@@ -321,11 +168,6 @@ def _breed_one(
     rng: random.Random,
     tournament_fn: TournamentFn,
 ) -> Individual | None:
-    """Produce one offspring via crossover or mutation.
-
-    `tournament_fn` is supplied by the caller so the same breeding
-    loop serves single-objective, diversity-aware, and Pareto paths.
-    """
     parent_a = tournament_fn()
 
     use_crossover = (
@@ -401,19 +243,12 @@ def next_generation(
     if len(parents) == 0:
         raise SelectionError("cannot evolve an empty population")
 
-    if config.mode == "single" and config.diversity_enabled:
-        adjusted = compute_adjusted_fitness(parents)
-        elites = _select_elites_with_diversity(
-            parents, config.elite_count, adjusted,
+    if config.mode == "single":
+        elites = select_elites(
+            parents,
+            config.elite_count,
+            reserve_multi_field=config.diversity_enabled,
         )
-
-        def tournament_fn() -> Individual:
-            return _tournament_select_with_diversity(
-                parents, config.tournament_size, rng, adjusted,
-            )
-
-    elif config.mode == "single":
-        elites = select_elites(parents, config.elite_count)
 
         def tournament_fn() -> Individual:
             return tournament_select(

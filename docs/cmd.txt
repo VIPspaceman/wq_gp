@@ -1,1 +1,5 @@
 conda deactivate && cd .. && source .venv/bin/activate && cd wq_gp
+
+tmux ls
+
+tmux kill-session -t ab_div

@@ -3,8 +3,8 @@
 Design decisions:
 - Subparsers via argparse. See D-087.
 - Config is JSON, flag > config > default. See D-088.
-- Credentials: env vars take precedence over the config file.
-  See D-089 and D-135.
+- Credentials: env vars, with optional config-file fallback. See
+  D-089 and D-135.
 - SIGINT propagates; exit code 130. See D-090.
 - Structured logging to stderr; --log-level controls verbosity. See
   D-091.
@@ -14,13 +14,13 @@ Design decisions:
 - `build-pool` accepts simulation settings flags. See D-107.
 - Logs go to the "wqgp.cli" channel. See D-134.
 - `--settings` and `--run-config` split the two loader roles.
-  `--config` remains as a backward-compatible alias. See D-136.
-- `cache` subcommand inspects and manages the cross-run evaluation
-  cache. See D-138.
-- `run` builds an EvaluationConfig (shared by the cache key and the
-  BrainClient request) and an EvaluationCache, passes both to the
-  Coordinator. `--no-cache` disables the cache; `--no-diversity`
-  disables fitness sharing. See D-146, D-147, D-149.
+  See D-136.
+- `cache` subcommand inspects and manages the cache. See D-138.
+- `run` builds an EvaluationConfig and an EvaluationCache. See
+  D-146, D-147, D-149.
+- `--fitness-strategy` selects the fitness function. See D-158.
+- `--seed-count` and `--no-seed-injection` control seed injection.
+  Default is `seed_count=3` when neither is given. See D-170.
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from wqgp import __version__
+from wqgp.alpha_registry import AlphaRegistry
 from wqgp.brain.client import (
     BrainAuthError,
     BrainCredentials,
@@ -48,7 +49,6 @@ from wqgp.brain.pool_builder import (
     PoolBuilderProtocolError,
 )
 from wqgp.brain.transport import HttpTransport, RequestsTransport
-from wqgp.alpha_registry import AlphaRegistry
 from wqgp.budget import Budget
 from wqgp.cache import EvaluationCache
 from wqgp.checkpoint import CheckpointStore, CorruptCheckpointError
@@ -88,13 +88,9 @@ EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
 
-# --- user-facing error ------------------------------------------------------
-
 class CliError(RuntimeError):
     """Raised for expected user-facing errors."""
 
-
-# --- logging ---------------------------------------------------------------
 
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
@@ -183,13 +179,9 @@ def _resolve_credentials(settings: Settings) -> BrainCredentials:
     )
 
 
-# --- transport factory (patched in tests) -----------------------------------
-
 def _make_transport(args: argparse.Namespace) -> HttpTransport:
     return RequestsTransport()
 
-
-# --- config -----------------------------------------------------------------
 
 def _load_config(path: Path | None) -> dict[str, Any]:
     if path is None:
@@ -247,11 +239,6 @@ def _require(
 def _build_evaluation_config(
     args: argparse.Namespace,
 ) -> EvaluationConfig:
-    """Construct the single EvaluationConfig used for the whole run.
-
-    Both the cache key and the BRAIN request derive from this object,
-    so they cannot disagree about the settings. See D-138.
-    """
     defaults = BrainSettings()
     settings_defaults = args._settings.defaults
     return EvaluationConfig(BrainSettings(
@@ -275,8 +262,6 @@ def _build_evaluation_config(
         ),
     ))
 
-
-# --- argument parser --------------------------------------------------------
 
 def _add_settings_flags(p: argparse.ArgumentParser) -> None:
     defaults = BrainSettings()
@@ -336,10 +321,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--log-level",
         default=None,
         choices=_LOG_LEVELS,
-        help=(
-            "override the config file's logging.level "
-            "(default: value from config, or INFO)"
-        ),
+        help="override the config file's logging.level",
     )
     common.add_argument(
         "--log-file",
@@ -365,37 +347,13 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="fetch fields + operator names from BRAIN and write a pool",
     )
-    p_bp.add_argument(
-        "--signatures", required=True,
-        help="path to the operator signature table (JSON)",
-    )
-    p_bp.add_argument(
-        "--output", default="pool.json",
-        help="where to write the pool (default: pool.json)",
-    )
-    p_bp.add_argument(
-        "--page-limit", type=int, default=50,
-        help=(
-            "page size for paginated endpoints (default: 50). "
-            "BRAIN rejects large page sizes with HTTP 400."
-        ),
-    )
-    p_bp.add_argument(
-        "--max-pages", type=int, default=200,
-        help="hard cap on pages per endpoint (default: 200)",
-    )
-    p_bp.add_argument(
-        "--max-retries-on-429", type=int, default=3,
-        help="how many times to retry a rate-limited request (default: 3)",
-    )
-    p_bp.add_argument(
-        "--settings", default=None,
-        help="path to the settings file",
-    )
-    p_bp.add_argument(
-        "--config", default=None,
-        help="alias for --settings",
-    )
+    p_bp.add_argument("--signatures", required=True)
+    p_bp.add_argument("--output", default="pool.json")
+    p_bp.add_argument("--page-limit", type=int, default=50)
+    p_bp.add_argument("--max-pages", type=int, default=200)
+    p_bp.add_argument("--max-retries-on-429", type=int, default=3)
+    p_bp.add_argument("--settings", default=None)
+    p_bp.add_argument("--config", default=None)
     _add_settings_flags(p_bp)
     p_bp.set_defaults(handler=_cmd_build_pool)
 
@@ -406,8 +364,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run (or resume) a GP experiment",
     )
     _add_path_flags(p_run)
-    p_run.add_argument("--pool", default=None, help="pool JSON path")
-    p_run.add_argument("--run-id", default=None, help="experiment id")
+    p_run.add_argument("--pool", default=None)
+    p_run.add_argument("--run-id", default=None)
     p_run.add_argument("--total-simulations", type=int, default=None)
     p_run.add_argument("--per-generation-simulations", type=int, default=None)
     p_run.add_argument("--wall-time-seconds", type=float, default=None)
@@ -417,62 +375,49 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--crossover-rate", type=float, default=None)
     p_run.add_argument("--max-breeding-attempts", type=int, default=None)
     p_run.add_argument(
-        "--mode",
-        choices=("single", "pareto"),
-        default=None,
-        help=(
-            "selection mode: 'single' (sharpe only) or 'pareto' "
-            "(multi-objective). Default from config, else 'single'."
-        ),
+        "--mode", choices=("single", "pareto"), default=None,
     )
     p_run.add_argument("--seed", type=int, default=None)
     p_run.add_argument("--max-generations", type=int, default=None)
     p_run.add_argument("--checkpoint-root", default=None)
     p_run.add_argument("--evaluation-db", default=None)
     p_run.add_argument("--n-workers", type=int, default=None)
-    p_run.add_argument(
-        "--max-concurrent", type=int, default=None,
-        help=(
-            "maximum concurrent BRAIN simulations. "
-            "Default from settings.defaults.max_concurrent, or 2."
-        ),
-    )
+    p_run.add_argument("--max-concurrent", type=int, default=None)
     p_run.add_argument("--initial-population-size", type=int, default=None)
-    p_run.add_argument(
-        "--dry-run", action="store_true",
-        help="use a deterministic fake evaluator; do not contact BRAIN",
-    )
+    p_run.add_argument("--dry-run", action="store_true")
     p_run.add_argument(
         "--no-diversity", action="store_true",
-        help=(
-            "disable fitness sharing (diversity mechanism); "
-            "falls back to raw-fitness selection. See D-149."
-        ),
+        help="disable diversity mechanism (A + A'). See D-149.",
     )
     p_run.add_argument(
         "--fitness-strategy",
         choices=("feasibility", "sharpe"),
         default=None,
-        help=(
-            "fitness function: 'feasibility' (BRAIN checks first) or "
-            "'sharpe' (legacy). Default from config, else 'feasibility'. "
-            "See D-157."
-        ),
+        help="fitness function. Default 'feasibility'. See D-158.",
     )
     p_run.add_argument(
         "--no-cache", action="store_true",
+        help="bypass the cross-run cache. See D-147.",
+    )
+    p_run.add_argument(
+        "--seed-count",
+        type=int,
+        default=None,
         help=(
-            "ignore the cross-run evaluation cache for this run: "
-            "every individual is submitted to BRAIN and nothing is "
-            "written back to the cache. See D-147."
+            "number of seed ASTs to inject into gen 0. Default 3. "
+            "Pass 0 to disable seed injection. See D-170."
+        ),
+    )
+    p_run.add_argument(
+        "--no-seed-injection", action="store_true",
+        help=(
+            "shortcut for --seed-count 0. Disables seed injection. "
+            "See D-170."
         ),
     )
     p_run.add_argument(
         "--telegram", action="store_true",
-        help=(
-            "send lifecycle events to Telegram "
-            "(requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)"
-        ),
+        help="send lifecycle events to Telegram",
     )
     p_run.set_defaults(handler=_cmd_run)
 
@@ -482,26 +427,11 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="audit a signature table against BRAIN's operator list",
     )
-    p_sig.add_argument(
-        "--signatures", required=True,
-        help="path to the signature table to audit",
-    )
-    p_sig.add_argument(
-        "--max-suggestions", type=int, default=20,
-        help="how many paste-ready skeletons to print (default: 20)",
-    )
-    p_sig.add_argument(
-        "--strict", action="store_true",
-        help="exit non-zero if the table is missing operators",
-    )
-    p_sig.add_argument(
-        "--settings", default=None,
-        help="path to the settings file",
-    )
-    p_sig.add_argument(
-        "--config", default=None,
-        help="alias for --settings",
-    )
+    p_sig.add_argument("--signatures", required=True)
+    p_sig.add_argument("--max-suggestions", type=int, default=20)
+    p_sig.add_argument("--strict", action="store_true")
+    p_sig.add_argument("--settings", default=None)
+    p_sig.add_argument("--config", default=None)
     p_sig.set_defaults(handler=_cmd_signatures)
 
     # --- list-runs ---
@@ -512,7 +442,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_lr.add_argument(
         "--checkpoint-root", default="./checkpoints",
-        help="checkpoint root (default: ./checkpoints)",
     )
     p_lr.set_defaults(handler=_cmd_list_runs)
 
@@ -526,59 +455,24 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="cache_command", metavar="CACHE_COMMAND"
     )
 
-    p_cs = cache_sub.add_parser(
-        "stats",
-        help="print cache size, hit count, and age of entries",
-    )
-    p_cs.add_argument(
-        "--cache-path", default=None,
-        help="override the cache DB path",
-    )
-    p_cs.add_argument(
-        "--settings", default=None,
-        help="path to the settings file",
-    )
-    p_cs.add_argument(
-        "--config", default=None,
-        help="alias for --settings",
-    )
+    p_cs = cache_sub.add_parser("stats")
+    p_cs.add_argument("--cache-path", default=None)
+    p_cs.add_argument("--settings", default=None)
+    p_cs.add_argument("--config", default=None)
     p_cs.set_defaults(handler=_cmd_cache_stats)
 
-    p_cc = cache_sub.add_parser(
-        "clear",
-        help="delete cached entries",
-    )
-    p_cc.add_argument(
-        "--cache-path", default=None,
-        help="override the cache DB path",
-    )
-    p_cc.add_argument(
-        "--before", default=None,
-        help=(
-            "only delete entries created before this date "
-            "(YYYY-MM-DD). Without it, clears everything."
-        ),
-    )
-    p_cc.add_argument(
-        "--yes", action="store_true",
-        help="skip the confirmation prompt",
-    )
-    p_cc.add_argument(
-        "--settings", default=None,
-        help="path to the settings file",
-    )
-    p_cc.add_argument(
-        "--config", default=None,
-        help="alias for --settings",
-    )
+    p_cc = cache_sub.add_parser("clear")
+    p_cc.add_argument("--cache-path", default=None)
+    p_cc.add_argument("--before", default=None)
+    p_cc.add_argument("--yes", action="store_true")
+    p_cc.add_argument("--settings", default=None)
+    p_cc.add_argument("--config", default=None)
     p_cc.set_defaults(handler=_cmd_cache_clear)
 
     p_cache.set_defaults(handler=_cmd_cache_help)
 
     return parser
 
-
-# --- evaluators -------------------------------------------------------------
 
 def _dry_run_evaluator(task: Task) -> TaskResult:
     digest = hashlib.sha256(task.fingerprint.encode("utf-8")).digest()
@@ -590,6 +484,68 @@ def _dry_run_evaluator(task: Task) -> TaskResult:
         fitness=fitness,
         metrics=(("sharpe", fitness),),
     )
+
+
+def _build_client_with_creds(
+    creds: BrainCredentials,
+    evaluation_config: EvaluationConfig,
+    max_concurrent: int,
+    alpha_registry: AlphaRegistry | None = None,
+    fitness_fn=feasibility_fitness,
+):
+    from wqgp.brain.client import BrainClient
+    return BrainClient(
+        credentials=creds,
+        settings=evaluation_config.settings,
+        transport=RequestsTransport(),
+        max_concurrent=max_concurrent,
+        alpha_registry=alpha_registry,
+        fitness_fn=fitness_fn,
+    )
+
+
+def _resolve_fitness_strategy(
+    args: argparse.Namespace, cfg: dict[str, Any],
+) -> str:
+    raw = _pick(
+        args, cfg, "fitness_strategy", "fitness_strategy", "feasibility",
+    )
+    if raw not in ("feasibility", "sharpe"):
+        raise CliError(
+            f"invalid fitness strategy: {raw!r}; "
+            f"expected 'feasibility' or 'sharpe'"
+        )
+    return raw
+
+
+def _fitness_fn_for(strategy: str):
+    if strategy == "sharpe":
+        return sharpe_only_fitness
+    return feasibility_fitness
+
+
+def _resolve_seed_count(
+    args: argparse.Namespace, cfg: dict[str, Any],
+) -> int:
+    """Resolve seed_count from flag, then config, then default 3.
+
+    `--no-seed-injection` forces 0 regardless of other sources.
+    See D-170.
+    """
+    if getattr(args, "no_seed_injection", False):
+        return 0
+    raw = _pick(
+        args, cfg, "seed_count", "seed_count", 3,
+    )
+    try:
+        n = int(raw)
+    except (TypeError, ValueError) as e:
+        raise CliError(
+            f"invalid seed_count: {raw!r}"
+        ) from e
+    if n < 0:
+        raise CliError(f"seed_count must be >= 0, got {n}")
+    return n
 
 
 def _make_evaluator(
@@ -621,46 +577,6 @@ def _make_evaluator(
     )
 
 
-def _build_client_with_creds(
-    creds: BrainCredentials,
-    evaluation_config: EvaluationConfig,
-    max_concurrent: int,
-    alpha_registry: AlphaRegistry | None = None,
-    fitness_fn=feasibility_fitness,
-):
-    from wqgp.brain.client import BrainClient
-    return BrainClient(
-        credentials=creds,
-        settings=evaluation_config.settings,
-        transport=RequestsTransport(),
-        max_concurrent=max_concurrent,
-        alpha_registry=alpha_registry,
-        fitness_fn=fitness_fn,
-    )
-
-
-def _resolve_fitness_strategy(
-    args: argparse.Namespace, cfg: dict[str, Any],
-) -> str:
-    """Return the strategy name: 'feasibility' or 'sharpe'."""
-    raw = _pick(
-        args, cfg, "fitness_strategy", "fitness_strategy", "feasibility",
-    )
-    if raw not in ("feasibility", "sharpe"):
-        raise CliError(
-            f"invalid fitness strategy: {raw!r}; "
-            f"expected 'feasibility' or 'sharpe'"
-        )
-    return raw
-
-
-def _fitness_fn_for(strategy: str):
-    """Map a strategy name to its fitness function."""
-    if strategy == "sharpe":
-        return sharpe_only_fitness
-    return feasibility_fitness
-
-
 def _make_notifier(args: argparse.Namespace) -> Notifier:
     if not args.telegram:
         return NullNotifier()
@@ -690,8 +606,6 @@ def _make_cache(
     path.parent.mkdir(parents=True, exist_ok=True)
     return EvaluationCache(path, ttl_days=settings.cache.ttl_days)
 
-
-# --- commands: build-pool ---------------------------------------------------
 
 def _cmd_build_pool(args: argparse.Namespace) -> int:
     sig_path = Path(args.signatures)
@@ -737,8 +651,6 @@ def _cmd_build_pool(args: argparse.Namespace) -> int:
         log.info("  %s: %s", k, v)
     return EXIT_OK
 
-
-# --- commands: run ----------------------------------------------------------
 
 def _resolve_budget(
     args: argparse.Namespace, cfg: dict[str, Any]
@@ -800,36 +712,26 @@ def _resolve_selection(
         diversity_enabled = False
 
     return SelectionConfig(
-        population_size=int(
-            _pick(
-                args, s, "population_size", "population_size",
-                defaults.population_size,
-            )
-        ),
-        elite_count=int(
-            _pick(
-                args, s, "elite_count", "elite_count",
-                defaults.elite_count,
-            )
-        ),
-        tournament_size=int(
-            _pick(
-                args, s, "tournament_size", "tournament_size",
-                defaults.tournament_size,
-            )
-        ),
-        crossover_rate=float(
-            _pick(
-                args, s, "crossover_rate", "crossover_rate",
-                defaults.crossover_rate,
-            )
-        ),
-        max_breeding_attempts=int(
-            _pick(
-                args, s, "max_breeding_attempts",
-                "max_breeding_attempts", defaults.max_breeding_attempts,
-            )
-        ),
+        population_size=int(_pick(
+            args, s, "population_size", "population_size",
+            defaults.population_size,
+        )),
+        elite_count=int(_pick(
+            args, s, "elite_count", "elite_count",
+            defaults.elite_count,
+        )),
+        tournament_size=int(_pick(
+            args, s, "tournament_size", "tournament_size",
+            defaults.tournament_size,
+        )),
+        crossover_rate=float(_pick(
+            args, s, "crossover_rate", "crossover_rate",
+            defaults.crossover_rate,
+        )),
+        max_breeding_attempts=int(_pick(
+            args, s, "max_breeding_attempts",
+            "max_breeding_attempts", defaults.max_breeding_attempts,
+        )),
         mode=str(mode),
         pareto_objectives=tuple(pareto_objectives),
         diversity_enabled=diversity_enabled,
@@ -860,6 +762,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     evaluation_config = _build_evaluation_config(args)
     fitness_strategy = _resolve_fitness_strategy(args, cfg)
+    seed_count = _resolve_seed_count(args, cfg)
 
     run_cfg = RunConfig(
         run_id=str(_require(args, cfg, "run_id", "run_id", "--run-id")),
@@ -869,24 +772,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
         seed=int(_pick(args, cfg, "seed", "seed", defaults.seed)),
         evaluation_config=evaluation_config,
         fitness_strategy=fitness_strategy,
-        max_generations=int(
-            _pick(
-                args, cfg, "max_generations", "max_generations",
-                defaults.max_generations,
-            )
-        ),
-        checkpoint_root=Path(
-            _pick(
-                args, cfg, "checkpoint_root",
-                "checkpoint_root", defaults.checkpoint_root,
-            )
-        ),
+        seed_count=seed_count,
+        max_generations=int(_pick(
+            args, cfg, "max_generations", "max_generations",
+            defaults.max_generations,
+        )),
+        checkpoint_root=Path(_pick(
+            args, cfg, "checkpoint_root",
+            "checkpoint_root", defaults.checkpoint_root,
+        )),
         evaluation_db=(
             None if eval_db_raw is None else Path(eval_db_raw)
         ),
-        n_workers=int(
-            _pick(args, cfg, "n_workers", "n_workers", defaults.n_workers)
-        ),
+        n_workers=int(_pick(
+            args, cfg, "n_workers", "n_workers", defaults.n_workers,
+        )),
         initial_population_size=(
             None if init_pop_raw is None else int(init_pop_raw)
         ),
@@ -907,8 +807,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.info("starting new run %s", run_cfg.run_id)
 
-    # Build or skip the alpha registry the same way as the cache:
-    # --no-cache disables both, and dry-run never touches it.
     alpha_registry: AlphaRegistry | None = None
     if (
         not getattr(args, "no_cache", False)
@@ -949,8 +847,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-# --- commands: signatures ---------------------------------------------------
-
 def _cmd_signatures(args: argparse.Namespace) -> int:
     sig_path = Path(args.signatures)
     try:
@@ -970,7 +866,6 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
         raise CliError(f"failed to audit signatures: {e}") from e
 
     _print_audit(audit, max_suggestions=args.max_suggestions)
-
     if args.strict and not audit.is_complete():
         return EXIT_ERROR
     return EXIT_OK
@@ -981,57 +876,34 @@ def _print_audit(audit: SignatureAudit, *, max_suggestions: int) -> None:
     print(f"Table operators: {audit.table_operator_count}")
     print(f"Common:          {len(audit.common)}")
     print()
-
     if audit.extra_in_table:
-        print(
-            f"In table but not on BRAIN "
-            f"({len(audit.extra_in_table)}):"
-        )
+        print(f"In table but not on BRAIN ({len(audit.extra_in_table)}):")
         for name in audit.extra_in_table:
             print(f"  {name}")
         print()
-        print("These may have been renamed or removed by BRAIN.")
-        print()
-
     if audit.missing_from_table:
-        print(
-            f"Missing from table "
-            f"({len(audit.missing_from_table)}):"
-        )
+        print(f"Missing from table ({len(audit.missing_from_table)}):")
         for name in audit.missing_from_table:
             print(f"  {name}")
         print()
-        print("Suggested skeletons (paste into signatures.json):")
+        print("Suggested skeletons:")
         print(format_skeletons(
-            audit.missing_from_table,
-            limit=max_suggestions,
+            audit.missing_from_table, limit=max_suggestions,
         ))
-        print()
-        print(
-            'Note: type placeholder "MATRIX" is a guess. '
-            "Verify each signature"
-        )
-        print("against BRAIN's documentation before use.")
     else:
-        print(
-            "Table is complete: every BRAIN operator has a signature."
-        )
+        print("Table is complete.")
 
-
-# --- commands: list-runs ----------------------------------------------------
 
 def _cmd_list_runs(args: argparse.Namespace) -> int:
     root = Path(args.checkpoint_root)
     if not root.exists():
         print(f"no checkpoint root at {root}", file=sys.stderr)
         return EXIT_OK
-
     store = CheckpointStore(root)
     runs = store.list_runs()
     if not runs:
         print(f"no runs in {root}", file=sys.stderr)
         return EXIT_OK
-
     print(f"{'run_id':<30} {'latest_gen':>12}")
     print("-" * 43)
     for run_id in runs:
@@ -1043,8 +915,6 @@ def _cmd_list_runs(args: argparse.Namespace) -> int:
         print(f"{run_id:<30} {gen:>12}")
     return EXIT_OK
 
-
-# --- commands: cache --------------------------------------------------------
 
 def _resolve_cache_path(
     args: argparse.Namespace,
@@ -1061,27 +931,21 @@ def _resolve_cache_path(
 
 def _cmd_cache_help(args: argparse.Namespace) -> int:
     print("usage: wqgp cache {stats,clear}", file=sys.stderr)
-    print()
-    print("  stats   print cache size, hit count, and age")
-    print("  clear   delete cached entries")
     return EXIT_USAGE
 
 
 def _cmd_cache_stats(args: argparse.Namespace) -> int:
     settings = args._settings
     path = _resolve_cache_path(args, settings)
-
     if not path.exists():
         print(f"no cache DB at {path}")
         print("(it will be created on the next run)")
         return EXIT_OK
-
     cache = EvaluationCache(path, ttl_days=settings.cache.ttl_days)
     try:
         s = cache.stats()
     finally:
         cache.close()
-
     print(f"cache DB:  {path}")
     print(f"ttl:       {settings.cache.ttl_days} days")
     print()
@@ -1105,11 +969,9 @@ def _cmd_cache_stats(args: argparse.Namespace) -> int:
 def _cmd_cache_clear(args: argparse.Namespace) -> int:
     settings = args._settings
     path = _resolve_cache_path(args, settings)
-
     if not path.exists():
         print(f"no cache DB at {path}", file=sys.stderr)
         return EXIT_OK
-
     before_ts: float | None = None
     if args.before is not None:
         import datetime as _dt
@@ -1120,7 +982,6 @@ def _cmd_cache_clear(args: argparse.Namespace) -> int:
                 f"--before must be YYYY-MM-DD, got {args.before!r}"
             )
         before_ts = dt.timestamp()
-
     if not args.yes:
         if before_ts is None:
             prompt = f"Delete ALL entries in {path}? [y/N] "
@@ -1133,13 +994,11 @@ def _cmd_cache_clear(args: argparse.Namespace) -> int:
         if answer not in ("y", "yes"):
             print("aborted")
             return EXIT_OK
-
     cache = EvaluationCache(path, ttl_days=settings.cache.ttl_days)
     try:
         removed = cache.clear(before_ts=before_ts)
     finally:
         cache.close()
-
     if before_ts is None:
         print(f"deleted {removed} entries from {path}")
     else:
@@ -1150,16 +1009,12 @@ def _cmd_cache_clear(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-# --- entry point ------------------------------------------------------------
-
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-
     if getattr(args, "command", None) is None:
         parser.print_help(sys.stderr)
         return EXIT_USAGE
-
     try:
         settings = _load_settings(args)
         setup_logging(settings.logging)
