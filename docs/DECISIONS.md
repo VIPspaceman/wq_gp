@@ -4871,3 +4871,11 @@ test pool that lacks the seed fields. Each such call must include
 path reaches `Coordinator._initial_setup`, `load_seeds` fails on
 every builder, and the test gets `EXIT_ERROR` instead of the behavior
 it was written to check.
+
+## D-170 — Synthetic test pools must disable seed injection
+
+**Decision**: Any `RunConfig` constructed with a synthetic test pool (e.g., in `test_coordinator.py` / `test_notification_integration.py`) must explicitly set `seed_count=0`.
+
+**Why**: `load_seeds` raises `RuntimeError` when none of the 5 production seeds can be built against the pool (D-169). Synthetic pools only contain generic fields (`close`, `open`, `high`, `low`, `volume`, `vwap`), so every seed fails and the run aborts—even though the test is only exercising coordinator mechanics, not alpha viability.
+
+**Revisit if**: seeds are ever parameterized by pool composition, or if a synthetic pool is extended to support at least one seed shape. (Neither is planned; keep the switch explicit.)

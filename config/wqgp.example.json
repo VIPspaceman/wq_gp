@@ -1,11 +1,10 @@
 {
   "$schema": "./wqgp.schema.json",
-
   "credentials": {
     "username": "YOUR_BRAIN_USERNAME_HERE",
     "password": "YOUR_BRAIN_PASSWORD_HERE"
   },
-
+  "seed_count": 3,
   "logging": {
     "level": "INFO",
     "style": "default",
@@ -20,13 +19,11 @@
       "cli": "INFO"
     }
   },
-
   "cache": {
     "enabled": true,
     "ttl_days": 90,
     "path": null
   },
-
   "defaults": {
     "region": "USA",
     "universe": "TOP3000",
